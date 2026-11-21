@@ -1,0 +1,301 @@
+name: AT
+
+on:
+  schedule:
+    - cron: '30 0 * * *'
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Write and push GLOBAI.list when publishing is enabled
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: globai-sync-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  preview:
+    if: >-
+      github.ref != format('refs/heads/{0}', github.event.repository.default_branch) ||
+      vars.GLOBAI_ENABLE_PUBLISH != 'true' ||
+      (github.event_name == 'workflow_dispatch' && !inputs.publish)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Preview GLOBAI sync
+        shell: bash
+        run: &sync_globai |
+          set --
+          if [[ "${GLOBAI_SYNC_MODE:-preview}" == "publish" ]]; then
+            set -- --write
+          fi
+          python3 - "$@" <<'PYTHON'
+          """Validate MagicRule GlobalAI for Surge and optionally update the SG mirror."""
+          import argparse
+          from collections import Counter
+          from difflib import unified_diff
+          from hashlib import sha256
+          import ipaddress
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import sys
+          from tempfile import NamedTemporaryFile
+          from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+
+          ORIGIN = "https://magicrule.pages.dev"
+          INDEX_URL = f"{ORIGIN}/data/index/Surge.json"
+          RULE_ID = "24dbbb36-e5c5-4800-8fde-4af469213846"
+          ROOT = Path.cwd().resolve()
+          TARGET = ROOT / "RULE-SET/GLOBAI.list"
+          HOST_TYPES = ("DOMAIN", "DOMAIN-SUFFIX")
+          IP_TYPES = ("IP-CIDR", "IP-CIDR6", "IP-ASN")
+          RULE_TYPES = (*HOST_TYPES, "DOMAIN-KEYWORD", "URL-REGEX", *IP_TYPES, "PROCESS-NAME")
+          LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+          HOSTNAME = re.compile(rf"{LABEL}(?:\.{LABEL})+")
+          REVIEWED_URL_REGEX = r"https://www\.google\.com/.*continue=https://gemini\.google\.com.+"
+          EXPECTED_PROVIDERS = {
+              "https://github.com/v2fly/domain-list-community",
+              "https://raw.githubusercontent.com/VPSDance/ai-proxy-rules/refs/heads/main/rules/surge/all.list",
+              "https://ruleset.skk.moe/List/non_ip/ai.conf",
+          }
+          MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+
+
+          class NoRedirect(HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+
+
+          def fetch(url):
+              request = Request(url, headers={"User-Agent": "SG-GlobalAI-Sync/1"})
+              with build_opener(NoRedirect).open(request, timeout=30) as response:
+                  if response.status != 200:
+                      raise ValueError(f"Expected HTTP 200, received {response.status}")
+                  data = response.read(MAX_RESPONSE_BYTES + 1)
+              if len(data) > MAX_RESPONSE_BYTES:
+                  raise ValueError("Upstream response exceeds the size limit")
+              return data
+
+
+          def select_one(items, **fields):
+              matches = [item for item in items
+                         if all(item.get(k) == v for k, v in fields.items())]
+              if len(matches) != 1:
+                  raise ValueError("Could not identify exactly one GlobalAI resource")
+              return matches[0]
+
+
+          def magicrule_url(url, path_pattern):
+              if not re.fullmatch(re.escape(ORIGIN) + path_pattern, url):
+                  raise ValueError("Unexpected MagicRule resource URL")
+              return url
+
+
+          def read_source():
+              index = json.loads(fetch(INDEX_URL))
+              if index["client"] != "Surge":
+                  raise ValueError("Expected the Surge index")
+              row = select_one(index["rules"], id=RULE_ID, name="GlobalAI")
+              url = magicrule_url(row["manifest"], r"/data/rules/Surge/[0-9a-f]+/manifest\.json")
+              manifest = json.loads(fetch(url))
+              if manifest["client"] != "Surge" or manifest["rule"] != "GlobalAI":
+                  raise ValueError("Expected the Surge GlobalAI manifest")
+              if set(row["providers"]) != EXPECTED_PROVIDERS or set(manifest["providers"]) != EXPECTED_PROVIDERS:
+                  raise ValueError("Upstream provider list changed. Review provenance before updating.")
+              for field in ("rule_updated_at", "type_counts", "total_line_count"):
+                  if row[field] != manifest[field]:
+                      raise ValueError("Index and manifest disagree. Retry after upstream finishes publishing.")
+              full = select_one(manifest["artifacts"], key="rules", role="full",
+                                ext="list", empty=False, binary=False)
+              url = magicrule_url(full["url"], r"/data/_shared/artifacts/GlobalAI_rules_[0-9a-f]+\.list")
+              data = fetch(url)
+              if sha256(data).hexdigest() != full["dedupe"]["bytes_sha256"]:
+                  raise ValueError("GlobalAI download does not match its manifest SHA-256")
+              rules = parse_rules(data.decode("utf-8-sig"), "MagicRule")
+              if len(rules) != manifest["total_line_count"] or Counter(r[0] for r in rules) != manifest["type_counts"]:
+                  raise ValueError("GlobalAI rule counts do not match its manifest")
+              return rules
+
+
+          def parse_rules(text, source):
+              rules = []
+              for number, raw in enumerate(text.splitlines(), 1):
+                  line = raw.strip(" \t")
+                  if not line or line.startswith(("#", "//", ";")):
+                      continue
+                  try:
+                      fields = [field.strip(" \t") for field in line.split(",")]
+                      rules.append(parse_rule(fields))
+                  except ValueError as error:
+                      raise ValueError(f"{source} line {number}: {error}") from error
+              if not rules:
+                  raise ValueError(f"{source} has no rules")
+              return rules
+
+
+          def parse_rule(fields):
+              kind = fields[0]
+              if kind not in RULE_TYPES:
+                  raise ValueError("unsupported rule type")
+              if kind in IP_TYPES:
+                  if len(fields) != 3 or fields[2] != "no-resolve":
+                      raise ValueError("expected an IP matcher with no-resolve and no policy")
+              elif len(fields) != 2:
+                  raise ValueError("expected a matcher with no extra fields or policy")
+
+              value = fields[1]
+              if kind in HOST_TYPES:
+                  value = value.lower()
+                  if not fields[1].isascii() or len(value) > 253 or not HOSTNAME.fullmatch(value):
+                      raise ValueError("invalid hostname; expected a multi-label ASCII hostname")
+              elif kind == "DOMAIN-KEYWORD":
+                  if not re.fullmatch(r"[A-Za-z0-9._-]+", value):
+                      raise ValueError("unsupported domain keyword")
+                  value = value.lower()
+              elif kind == "URL-REGEX":
+                  if value != REVIEWED_URL_REGEX:
+                      raise ValueError("URL-REGEX changed; validate the new expression in Surge first")
+              elif kind == "PROCESS-NAME":
+                  if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._ -]*", value):
+                      raise ValueError("unsupported process name")
+              elif kind == "IP-ASN":
+                  match = re.fullmatch(r"(?:AS)?([0-9]{1,10})", value, re.IGNORECASE)
+                  if not match or not 1 <= int(match[1]) <= 4294967295:
+                      raise ValueError("invalid ASN")
+                  value = str(int(match[1]))
+              else:
+                  network = ipaddress.ip_network(value)
+                  expected = 6 if kind == "IP-CIDR6" else 4
+                  if network.version != expected or "%" in value:
+                      raise ValueError("unexpected IP address family or scope")
+                  value = str(network)
+              return (kind, value, *fields[2:])
+
+
+          def covered_by(rule, suffixes):
+              kind, value, *_ = rule
+              if kind not in HOST_TYPES:
+                  return False
+              labels = value.split(".")
+              start = 1 if kind == "DOMAIN-SUFFIX" else 0
+              return any(".".join(labels[i:]) in suffixes for i in range(start, len(labels)))
+
+
+          def normalize(rules):
+              unique = list(dict.fromkeys(rules))
+              suffixes = {rule[1] for rule in unique if rule[0] == "DOMAIN-SUFFIX"}
+              retained = [rule for rule in unique if not covered_by(rule, suffixes)]
+              hosts = sorted((rule for rule in retained if rule[0] in HOST_TYPES),
+                             key=lambda rule: (HOST_TYPES.index(rule[0]), tuple(reversed(rule[1].split(".")))))
+              other = [rule for rule in retained if rule[0] not in HOST_TYPES]
+              return hosts + other, len(rules) - len(unique), len(unique) - len(retained)
+
+
+          def check_license_file():
+              path = os.environ.get("GLOBAI_LICENSE_FILE", "").strip()
+              if not path or not path.isprintable() or Path(path).is_absolute():
+                  raise ValueError("GLOBAI_LICENSE_FILE must name an existing repository-relative file")
+              notice = (ROOT / path).resolve()
+              if not notice.is_relative_to(ROOT) or not notice.is_file():
+                  raise ValueError("GLOBAI_LICENSE_FILE must name an existing repository-relative file")
+
+
+          def atomic_write(target, text):
+              with NamedTemporaryFile(dir=target.parent, mode="w", encoding="utf-8", delete=False) as temp:
+                  temporary = Path(temp.name)
+                  try:
+                      temp.write(text)
+                      temp.close()
+                      temporary.chmod(target.stat().st_mode & 0o777)
+                      temporary.replace(target)
+                  finally:
+                      temporary.unlink(missing_ok=True)
+
+
+          def sync(write, show_diff):
+              if write:
+                  check_license_file()
+              old_data = TARGET.read_bytes()
+              old_text = old_data.decode("utf-8-sig")
+              old, _, _ = normalize(parse_rules(old_text, "Current GLOBAI.list"))
+              source = read_source()
+              rules, duplicates, covered = normalize(source)
+              added = len(set(rules) - set(old))
+              removed = len(set(old) - set(rules))
+              limit = max(1, len(old) // 10)
+              print(f"Upstream: {len(source)}; duplicates: {duplicates}; covered: {covered}; output: {len(rules)}")
+              print(f"Compared with normalized repository rules: +{added}, -{removed}")
+              candidate = "".join(",".join(rule) + "\n" for rule in rules)
+              if old_data == candidate.encode("utf-8"):
+                  print("GLOBAI.list is up to date.")
+                  return
+
+              if show_diff:
+                  sys.stdout.writelines(unified_diff(old_text.splitlines(keepends=True),
+                                                     candidate.splitlines(keepends=True),
+                                                     "current/GLOBAI.list", "candidate/GLOBAI.list"))
+              if max(added, removed) > limit:
+                  raise ValueError(f"Rule changes exceed {limit} additions or removals; review the upstream change")
+              if write:
+                  atomic_write(TARGET, candidate)
+                  print("Updated RULE-SET/GLOBAI.list.")
+              else:
+                  print("Preview complete. Candidate differs from the current file.")
+
+
+          def main():
+              parser = argparse.ArgumentParser(description=__doc__)
+              mode = parser.add_mutually_exclusive_group()
+              mode.add_argument("--write", action="store_true", help="write RULE-SET/GLOBAI.list")
+              mode.add_argument("--diff", action="store_true", help="preview changes against RULE-SET/GLOBAI.list")
+              args = parser.parse_args()
+              try:
+                  sync(args.write, args.diff)
+              except (ValueError, OSError, KeyError, TypeError, AttributeError) as error:
+                  print(f"GlobalAI sync failed: {error}", file=sys.stderr)
+                  return 1
+              return 0
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PYTHON
+
+  publish:
+    if: >-
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
+      vars.GLOBAI_ENABLE_PUBLISH == 'true' &&
+      (github.event_name == 'schedule' || inputs.publish)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    env:
+      GLOBAI_LICENSE_FILE: ${{ vars.GLOBAI_LICENSE_FILE }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Generate validated rule set
+        shell: bash
+        env:
+          GLOBAI_SYNC_MODE: publish
+        run: *sync_globai
+      - name: Commit and push the rule set
+        run: |
+          git add -- RULE-SET/GLOBAI.list
+          if git diff --cached --quiet -- RULE-SET/GLOBAI.list; then
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'chore: sync GLOBAI rules'
+          git push origin "HEAD:${GITHUB_REF}"
