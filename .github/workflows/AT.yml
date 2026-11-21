@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       publish:
-        description: Write and push GLOBAI.list when publishing is enabled
+        description: Write and push GLOBAI.list
         type: boolean
         default: false
 
@@ -21,7 +21,6 @@ jobs:
   preview:
     if: >-
       github.ref != format('refs/heads/{0}', github.event.repository.default_branch) ||
-      vars.GLOBAI_ENABLE_PUBLISH != 'true' ||
       (github.event_name == 'workflow_dispatch' && !inputs.publish)
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -44,7 +43,6 @@ jobs:
           from hashlib import sha256
           import ipaddress
           import json
-          import os
           from pathlib import Path
           import re
           import sys
@@ -201,15 +199,6 @@ jobs:
               return hosts + other, len(rules) - len(unique), len(unique) - len(retained)
 
 
-          def check_license_file():
-              path = os.environ.get("GLOBAI_LICENSE_FILE", "").strip()
-              if not path or not path.isprintable() or Path(path).is_absolute():
-                  raise ValueError("GLOBAI_LICENSE_FILE must name an existing repository-relative file")
-              notice = (ROOT / path).resolve()
-              if not notice.is_relative_to(ROOT) or not notice.is_file():
-                  raise ValueError("GLOBAI_LICENSE_FILE must name an existing repository-relative file")
-
-
           def atomic_write(target, text):
               with NamedTemporaryFile(dir=target.parent, mode="w", encoding="utf-8", delete=False) as temp:
                   temporary = Path(temp.name)
@@ -223,8 +212,6 @@ jobs:
 
 
           def sync(write, show_diff):
-              if write:
-                  check_license_file()
               old_data = TARGET.read_bytes()
               old_text = old_data.decode("utf-8-sig")
               old, _, _ = normalize(parse_rules(old_text, "Current GLOBAI.list"))
@@ -274,14 +261,11 @@ jobs:
   publish:
     if: >-
       github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
-      vars.GLOBAI_ENABLE_PUBLISH == 'true' &&
       (github.event_name == 'schedule' || inputs.publish)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       contents: write
-    env:
-      GLOBAI_LICENSE_FILE: ${{ vars.GLOBAI_LICENSE_FILE }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Generate validated rule set
