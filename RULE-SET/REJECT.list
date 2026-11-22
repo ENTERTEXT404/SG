@@ -1,6 +1,5 @@
 IP-CIDR,14.29.101.160/32,no-resolve
-IP-CIDR,14.29.101.168/32,no-resolve
-IP-CIDR,14.29.101.169/32,no-resolve
+IP-CIDR,14.29.101.168/31,no-resolve
 IP-CIDR,38.190.225.166/32,no-resolve
 IP-CIDR,111.20.26.186/32,no-resolve
 IP-CIDR,112.84.130.73/32,no-resolve
@@ -29,7 +28,6 @@ DOMAIN,c.sayhi.360.cn
 DOMAIN,commercial.shouji.360.cn
 DOMAIN,huodong.ios.shouji.360.cn
 DOMAIN,xadsmartget.adgain.cn
-DOMAIN,v.adintl.cn
 DOMAIN,adjust.cn
 DOMAIN,analytics.adjust.cn
 DOMAIN,adview.cn
@@ -160,9 +158,6 @@ DOMAIN,gw5.push.mcp.weibo.cn
 DOMAIN,gw6.push.mcp.weibo.cn
 DOMAIN,wwads.cn
 DOMAIN,analysis.yozocloud.cn
-DOMAIN,adm.zhangyuyidong.cn
-DOMAIN,sdk.zhangyuyidong.cn
-DOMAIN,sdklog.zhangyuyidong.cn
 DOMAIN,ads.zhinengxiyifang.cn
 DOMAIN,adstudio-assets.scdn.co
 DOMAIN,m1.ad.10010.com
@@ -198,13 +193,9 @@ DOMAIN,p2-lm.adkwai.com
 DOMAIN,p3-lm.adkwai.com
 DOMAIN,p66-ad.adkwai.com
 DOMAIN,static.ads-twitter.com
-DOMAIN,adsmoloco.com
-DOMAIN,cdn-f.adsmoloco.com
-DOMAIN,tr-asia.adsmoloco.com
 DOMAIN,adx-saas.advlion.com
 DOMAIN,bj-td-menta-01-callback.advlion.com
 DOMAIN,s1.cdn-sg.advlion.com
-DOMAIN,sdk.adx.adwangmai.com
 DOMAIN,sdk.mobads.adwangmai.com
 DOMAIN,monitor.adxsenmeng.com
 DOMAIN,rtb.adxsenmeng.com
@@ -371,9 +362,6 @@ DOMAIN,ks.ferlytc.com
 DOMAIN,catalog.fjwhcbsh.com
 DOMAIN,flurry.com
 DOMAIN,adm.funshion.com
-DOMAIN,ad.gameley.com
-DOMAIN,de.ad.gameley.com
-DOMAIN,jp.ad.gameley.com
 DOMAIN,g-staic.ganjingworld.com
 DOMAIN,adsmind.gdtimg.com
 DOMAIN,public.gdtimg.com
@@ -415,8 +403,6 @@ DOMAIN,api-gd.hiaiabc.com
 DOMAIN,g-adnet.hiaiabc.com
 DOMAIN,log-verify.hiaiabc.com
 DOMAIN,m-adnet.hiaiabc.com
-DOMAIN,metrics.data.hicloud.com
-DOMAIN,metrics2.data.hicloud.com
 DOMAIN,grs.hicloud.com
 DOMAIN,logbak.hicloud.com
 DOMAIN,logservice.hicloud.com
@@ -785,11 +771,6 @@ DOMAIN,utoken.umeng.com
 DOMAIN,cnlogs.umengcloud.com
 DOMAIN,ulogs.umengcloud.com
 DOMAIN,o-sdk.mediation.unity3d.com
-DOMAIN,unityads.unity3d.com
-DOMAIN,adserver.unityads.unity3d.com
-DOMAIN,auction.unityads.unity3d.com
-DOMAIN,config.unityads.unity3d.com
-DOMAIN,webview.unityads.unity3d.com
 DOMAIN,mobilelog.upqzfile.com
 DOMAIN,ad.v3mh.com
 DOMAIN,ads.v3mh.com
@@ -837,9 +818,6 @@ DOMAIN,a0.app.xiaomi.com
 DOMAIN,data.mistat.india.xiaomi.com
 DOMAIN,api.installer.xiaomi.com
 DOMAIN,sdkconfig.ad.intl.xiaomi.com
-DOMAIN,t1.a.market.xiaomi.com
-DOMAIN,t2.a.market.xiaomi.com
-DOMAIN,t3.a.market.xiaomi.com
 DOMAIN,video.market.xiaomi.com
 DOMAIN,data.mistat.xiaomi.com
 DOMAIN,data.mistat.rus.xiaomi.com
@@ -863,7 +841,6 @@ DOMAIN,geo.yahoo.com
 DOMAIN,analytics.query.yahoo.com
 DOMAIN,udc.yahoo.com
 DOMAIN,udcm.yahoo.com
-DOMAIN,api.yfanads.com
 DOMAIN,ad-sdk-config.youdao.com
 DOMAIN,gorgon.youdao.com
 DOMAIN,ad.api.3g.youku.com
