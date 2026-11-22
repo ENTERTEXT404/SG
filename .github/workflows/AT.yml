@@ -9,12 +9,11 @@ on:
   pull_request:
     paths:
       - '.github/workflows/AT.yml'
-      - 'RULE-SET/CIDRCN.list'
       - 'RULE-SET/DIRECT.list'
   workflow_dispatch:
     inputs:
       publish:
-        description: Write and push GLOBAI.list, CIDRCN.list and DIRECT.list
+        description: Write and push GLOBAI.list and DIRECT.list
         type: boolean
         default: false
 
@@ -34,13 +33,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Verify generated CIDRCN block in DIRECT.list
+      - name: Verify DIRECT rules and generated CIDRs
         shell: bash
         env:
           CIDRCN_SYNC_MODE: check
         run: &sync_cidrcn |
           python3 - "${CIDRCN_SYNC_MODE:-preview}" <<'PYTHON'
-          """Sync Sukka's CIDRs to CIDRCN.list and the generated block in DIRECT.list."""
+          """Sync Sukka's IPv4 and IPv6 CIDRs to DIRECT.list."""
 
           import argparse
           import ipaddress
@@ -52,7 +51,6 @@ jobs:
 
 
           RULE_SET = Path("RULE-SET")
-          CIDRCN = RULE_SET / "CIDRCN.list"
           DIRECT = RULE_SET / "DIRECT.list"
           SOURCES = {
               4: "https://ruleset.skk.moe/List/ip/china_ip.conf",
@@ -60,17 +58,10 @@ jobs:
           }
           RULE_TYPES = {4: "IP-CIDR", 6: "IP-CIDR6"}
           IP_VERSIONS = {kind: version for version, kind in RULE_TYPES.items()}
-          CIDRCN_MARKER = b"\n# BEGIN GENERATED CIDRCN - see .github/workflows/AT.yml\n"
-          CIDRCN_NOTICE = (
-              b"# CIDRCN data adapted from Sukka's Ruleset (https://github.com/SukkaW/Surge).\n"
-              b"# CIDRCN data license: CC BY-SA 2.0 (https://creativecommons.org/licenses/by-sa/2.0/).\n"
-              b"# Adaptations: filtering, deduplication, aggregation and sorting.\n"
-              b"\n"
-          )
           MAX_BYTES = 2 * 1024 * 1024
           MAX_CHANGE_PERCENT = 10
 
-          # CIDRCN.list adapts Sukka's Ruleset (https://github.com/SukkaW/Surge).
+          # The CIDRs in DIRECT.list adapt Sukka's Ruleset (https://github.com/SukkaW/Surge).
           # License: CC BY-SA 2.0 (https://creativecommons.org/licenses/by-sa/2.0/).
           # Adaptation: comment and non-CIDR removal, deduplication, aggregation,
           # sorting and the exclusions below.
@@ -227,18 +218,32 @@ jobs:
               return result
 
 
-          def read_baseline(path):
-              all_networks = {version: [] for version in RULE_TYPES}
-              for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-                  kind, _, value = line.partition(",")
-                  try:
+          def read_direct(path):
+              # The trailing IP-CIDR and IP-CIDR6 rules belong to the upstream sync.
+              # Keep hand-maintained rules before these CIDRs.
+              manual = []
+              networks = {version: [] for version in RULE_TYPES}
+              in_cidrs = False
+              for number, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                  line = raw.strip()
+                  if not line or line.startswith(("#", "//", ";")):
+                      continue
+                  kind, comma, value = line.partition(",")
+                  if kind in IP_VERSIONS:
+                      in_cidrs = True
                       version = IP_VERSIONS[kind]
-                      all_networks[version].append(parse_network(value, version))
-                  except (KeyError, ValueError) as error:
-                      raise ValueError(f"invalid baseline rule at {path}:{number}") from error
-              if any(not networks for networks in all_networks.values()):
-                  raise ValueError(f"{path} must contain both address families")
-              return all_networks
+                      try:
+                          networks[version].append(parse_network(value, version))
+                      except ValueError as error:
+                          raise ValueError(f"{path}:{number}: invalid managed CIDR") from error
+                  elif in_cidrs or not comma or not value:
+                      raise ValueError(f"{path}:{number}: expected manual rules before the CIDR block")
+                  else:
+                      manual.append(line + "\n")
+              if any(not ranges or ranges != sorted(ipaddress.collapse_addresses(ranges))
+                     for ranges in networks.values()):
+                  raise ValueError("DIRECT.list CIDRs must contain both families, sorted and aggregated")
+              return "".join(manual).encode("utf-8"), networks
 
 
           def validate_change(old, new, version):
@@ -297,16 +302,6 @@ jobs:
               ).encode("utf-8")
 
 
-          def read_direct_prefix(cached):
-              prefix, marker, generated = DIRECT.read_bytes().partition(CIDRCN_MARKER)
-              if not marker:
-                  raise ValueError("DIRECT.list is missing its generated CIDRCN marker")
-              if generated != CIDRCN_NOTICE + cached:
-                  raise ValueError("DIRECT.list CIDRCN block differs from CIDRCN.list. "
-                                   "Keep manual rules above the generated marker.")
-              return prefix + marker + CIDRCN_NOTICE
-
-
           def main():
               parser = argparse.ArgumentParser(description=__doc__)
               parser.add_argument("mode", choices=("check", "preview", "publish"))
@@ -319,26 +314,20 @@ jobs:
                   parser.error("check uses only the committed files")
 
               try:
-                  baseline = read_baseline(CIDRCN)
-                  cached = render_cidrcn(baseline)
-                  if CIDRCN.read_bytes() != cached or any(
-                      ranges != sorted(ipaddress.collapse_addresses(ranges))
-                      for ranges in baseline.values()
-                  ):
-                      raise ValueError("CIDRCN.list is not sorted, canonical and aggregated")
-                  direct_prefix = read_direct_prefix(cached)
+                  manual, baseline = read_direct(DIRECT)
+                  current = DIRECT.read_bytes()
                   if args.mode == "check":
-                      print("DIRECT.list generated CIDRCN block matches CIDRCN.list.")
+                      if current != manual + render_cidrcn(baseline):
+                          raise ValueError("DIRECT.list must contain only rule lines followed by one final newline")
+                      print("DIRECT.list contains only rules and its generated CIDRs are canonical.")
                       return 0
 
-                  cidrcn = render_cidrcn(sync_networks(baseline, args.sources))
-                  outputs = ((CIDRCN, cidrcn), (DIRECT, direct_prefix + cidrcn))
-                  for target, data in outputs:
-                      if args.mode == "publish":
-                          write_if_changed(target, data)
-                      else:
-                          state = "is up to date" if target.read_bytes() == data else "would change"
-                          print(f"{target.name} {state}.")
+                  candidate = manual + render_cidrcn(sync_networks(baseline, args.sources))
+                  if args.mode == "publish":
+                      write_if_changed(DIRECT, candidate)
+                  else:
+                      state = "is up to date" if current == candidate else "would change"
+                      print(f"DIRECT.list {state}.")
               except (OSError, ValueError) as error:
                   print(f"CIDRCN / DIRECT sync failed: {error}", file=sys.stderr)
                   return 1
@@ -590,7 +579,7 @@ jobs:
               sys.exit(main())
           PYTHON
 
-      - name: Preview CIDRCN and DIRECT sync
+      - name: Preview DIRECT sync
         run: *sync_cidrcn
 
   publish:
@@ -645,18 +634,18 @@ jobs:
             echo "- Trigger: ${TRIGGER} ${SCHEDULE}"
             echo "- Started: $(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S %Z')"
           } >> "$GITHUB_STEP_SUMMARY"
-      - name: Generate CIDRCN and DIRECT rule sets
+      - name: Generate DIRECT rule set
         shell: bash
         env:
           CIDRCN_SYNC_MODE: publish
         run: *sync_cidrcn
-      - name: Commit and push CIDRCN and DIRECT changes
+      - name: Commit and push DIRECT changes
         run: |
-          git add -- RULE-SET/CIDRCN.list RULE-SET/DIRECT.list
+          git add -- RULE-SET/DIRECT.list
           if git diff --cached --quiet; then
             exit 0
           fi
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git commit -m 'chore: sync CIDRCN and DIRECT rules'
+          git commit -m 'chore: sync DIRECT CIDRs'
           git push origin "HEAD:${GITHUB_REF}"
