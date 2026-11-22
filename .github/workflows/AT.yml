@@ -1,10 +1,13 @@
 name: AT
+run-name: >-
+  ${{ (github.event.schedule == '30 8 * * *' && 'AT scheduled 08:30 (Asia/Shanghai)') ||
+      (github.event.schedule == '45 8 * * *' && 'AT retry 08:45 (Asia/Shanghai)') || 'AT' }}
 
 on:
   schedule:
     - cron: '30 8 * * *'
       timezone: Asia/Shanghai
-    - cron: '45 8 * * *' # DIRECT and REJECT retry
+    - cron: '45 8 * * *' # Retry rule sets without a successful run today
       timezone: Asia/Shanghai
   pull_request:
     paths:
@@ -476,26 +479,40 @@ jobs:
                   return False
 
 
+          def fully_rejected(rule, reject_hosts, reject_parents, reject_keywords):
+              return (rule in reject_hosts or in_suffix(rule, reject_parents)
+                      or any(word in rule[1] for word in reject_keywords))
+
+
+          def remove_reject_conflicts(rules, reject):
+              reject_hosts, reject_keywords, _ = parse_reject(reject)
+              reject_parents = suffixes(reject_hosts)
+              excluded = {rule for rule in rules
+                          if fully_rejected(rule, reject_hosts, reject_parents, reject_keywords)}
+              return rules - excluded, excluded
+
+
           def sync_domains(old, reject):
               sources = fetch_domains()
               incoming = set().union(*sources.values(), DIRECT_EXTRAS)
               parents = suffixes(incoming)
-              # When a new broad suffix replaces an old exact rule upstream, keep the old
-              # coverage while the broader rule is pending.
-              retained = {rule for rule in old if rule in incoming or in_suffix(rule, parents)}
+              # Check old and new rules before compacting. A narrower REJECT rule
+              # cannot remove an entire DIRECT suffix or its other subdomains.
+              allowed, conflicts = remove_reject_conflicts(old | incoming, reject)
+              for kind, name in sorted(conflicts):
+                  print(f"Skip {kind},{name}: covered by REJECT")
+              incoming &= allowed
+              # Keep existing narrow coverage while a new upstream suffix is pending.
+              retained = {rule for rule in old & allowed if rule in incoming or in_suffix(rule, parents)}
               old, retained = compact_hosts(old), compact_hosts(retained)
               tracked_changes("DIRECT existing domains", old, retained)
-              reject_hosts, reject_keywords, _ = parse_reject(reject)
-              reject_parents = suffixes(reject_hosts)
               retained_parents = suffixes(retained)
               approved, pending = set(), []
               for rule in sorted(incoming - retained):
                   kind, name = rule
                   if in_suffix(rule, retained_parents):
                       continue
-                  if rule in reject_hosts or in_suffix(rule, reject_parents) or any(word in name for word in reject_keywords):
-                      print(f"Skip {kind},{name}: covered by REJECT")
-                  elif rule in sources["private"] or rule in DIRECT_EXTRAS:
+                  if rule in sources["private"] or rule in DIRECT_EXTRAS:
                       approved.add(rule)
                       print(f"Accept {kind},{name}: private or explicitly maintained")
                   elif kind == "DOMAIN" and "." in name:
@@ -873,10 +890,87 @@ jobs:
         shell: bash
         run: *sync_rules
 
-  publish:
+  plan-retry:
     if: >-
       github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
-      (github.event.schedule == '30 8 * * *' || inputs.publish)
+      github.event_name == 'schedule' && github.event.schedule == '45 8 * * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      actions: read
+    outputs:
+      globai_done: ${{ steps.history.outputs.globai_done }}
+      reject_done: ${{ steps.history.outputs.reject_done }}
+      direct_done: ${{ steps.history.outputs.direct_done }}
+    steps:
+      - name: Find successful jobs from today's scheduled runs
+        id: history
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PYTHON'
+          from datetime import datetime, timedelta, timezone
+          import json
+          from os import environ
+          from pathlib import Path
+          from urllib.parse import urlencode
+          from urllib.request import Request, urlopen
+          from zoneinfo import ZoneInfo
+
+          JOBS = {"publish": "globai_done", "publish-reject": "reject_done", "publish-direct": "direct_done"}
+
+
+          def read_api(path, **params):
+              base = f"{environ['GITHUB_API_URL']}/repos/{environ['GITHUB_REPOSITORY']}"
+              url = f"{base}/actions/{path}?{urlencode(params)}"
+              request = Request(url, headers={
+                  "Accept": "application/vnd.github+json",
+                  "Authorization": f"Bearer {environ['GH_TOKEN']}",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              })
+              with urlopen(request, timeout=12) as response:
+                  return json.load(response)
+
+
+          def successful_jobs(read, run_id, branch):
+              current = read(f"runs/{run_id}")
+              local = datetime.fromisoformat(current["created_at"].replace("Z", "+00:00")).astimezone(
+                  ZoneInfo("Asia/Shanghai")
+              )
+              start = local.replace(hour=0, minute=0, second=0, microsecond=0)
+              stop = start + timedelta(days=1)
+              created = "..".join(t.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") for t in (start, stop))
+              runs = read(f"workflows/{current['workflow_id']}/runs", branch=branch, event="schedule",
+                          created=created, per_page=100)["workflow_runs"]
+              successful = set()
+              for run in runs:
+                  created_at = datetime.fromisoformat(run["created_at"].replace("Z", "+00:00"))
+                  if run["id"] == run_id or not start <= created_at < stop:
+                      continue
+                  jobs = read(f"runs/{run['id']}/jobs", filter="all", per_page=100)["jobs"]
+                  successful.update(job["name"] for job in jobs if job["conclusion"] == "success")
+              return successful & JOBS.keys()
+
+
+          try:
+              done = successful_jobs(read_api, int(environ["GITHUB_RUN_ID"]), environ["GITHUB_REF_NAME"])
+          except (OSError, ValueError, TypeError, KeyError) as error:
+              print(f"::warning::Could not check prior sync results. Retrying all rule sets ({error}).")
+              done = set()
+          with Path(environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+              for job, result in JOBS.items():
+                  print(f"{result}={str(job in done).lower()}", file=output)
+          print("Already successful: " + (", ".join(sorted(done)) or "none"))
+          PYTHON
+
+  publish:
+    needs: plan-retry
+    if: >-
+      !cancelled() &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
+      ((github.event_name == 'schedule' && needs.plan-retry.outputs.globai_done != 'true') ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish))
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -902,11 +996,12 @@ jobs:
           git push origin "HEAD:${GITHUB_REF}"
 
   publish-reject:
-    needs: publish
+    needs: [plan-retry, publish]
     if: >-
       !cancelled() &&
       github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
-      (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.publish))
+      ((github.event_name == 'schedule' && needs.plan-retry.outputs.reject_done != 'true') ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish))
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -933,11 +1028,12 @@ jobs:
           git push origin "HEAD:${GITHUB_REF}"
 
   publish-direct:
-    needs: publish-reject
+    needs: [plan-retry, publish-reject]
     if: >-
       !cancelled() &&
       github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
-      (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.publish))
+      ((github.event_name == 'schedule' && needs.plan-retry.outputs.direct_done != 'true') ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish))
     runs-on: ubuntu-latest
     timeout-minutes: 8
     permissions:
