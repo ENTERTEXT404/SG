@@ -1,7 +1,6 @@
 DOMAIN,c.admob.com
 DOMAIN,admob-cn.com
 DOMAIN,app-analytics-services.com
-DOMAIN,app-measurement.com
 DOMAIN,app-measurement-cn.com
 DOMAIN,communities.apple.com
 DOMAIN,discussionschinese.apple.com
@@ -27,7 +26,6 @@ DOMAIN,clickserve.cc-dt.com
 DOMAIN,firebase-settings.crashlytics.com
 DOMAIN,update.crashlytics.com
 DOMAIN,www.destinationurl.com
-DOMAIN,adservice.google.com
 DOMAIN,cache-management-prod.google.com
 DOMAIN,redirector.c.chat.google.com
 DOMAIN,c.android.clients.google.com
@@ -48,11 +46,8 @@ DOMAIN,download.tensorflow.google.com
 DOMAIN,dg-meta.video.google.com
 DOMAIN,google-analytics-cn.com
 DOMAIN,clickserver.googleads.com
-DOMAIN,googleadservices.com
-DOMAIN,googleadservices-cn.com
 DOMAIN,googleanalytics.com
 DOMAIN,clientservices.googleapis.com
-DOMAIN,crashlyticsreports-pa.googleapis.com
 DOMAIN,fontfiles.googleapis.com
 DOMAIN,fonts.googleapis.com
 DOMAIN,imasdk.googleapis.com
@@ -69,7 +64,6 @@ DOMAIN,googlesyndication-cn.com
 DOMAIN,googletagmanager.com
 DOMAIN,googletagmanager-cn.com
 DOMAIN,googletagservices.com
-DOMAIN,googletagservices-cn.com
 DOMAIN,googletraveladservices.com
 DOMAIN,googletraveladservices-cn.com
 DOMAIN,googlevads-cn.com
@@ -88,7 +82,6 @@ DOMAIN,redirector.gcpcdn.gvt1.com
 DOMAIN,redirector.offline-maps.gvt1.com
 DOMAIN,redirector.gvt1.com
 DOMAIN,redirector.snap.gvt1.com
-DOMAIN,beacons.gvt2.com
 DOMAIN,beacons2.gvt2.com
 DOMAIN,beacons3.gvt2.com
 DOMAIN,beacons.gcp.gvt2.com
@@ -175,7 +168,6 @@ DOMAIN,cl2-cdn.origin-apple.com.akadns.net
 DOMAIN,cdn.globalsigncdn.com.cdn.cloudflare.net
 DOMAIN,clickserve.dartsearch.net
 DOMAIN,dartsearch-cn.net
-DOMAIN,doubleclick-cn.net
 DOMAIN,gonglchuangl.net
 DOMAIN,gongyichuangyi.net
 DOMAIN,avail.googleflights.net
@@ -5104,7 +5096,6 @@ DOMAIN-SUFFIX,1qit.com
 DOMAIN-SUFFIX,1qwe3r.com
 DOMAIN-SUFFIX,1r1g.com
 DOMAIN-SUFFIX,1renshi.com
-DOMAIN-SUFFIX,1rtb.com
 DOMAIN-SUFFIX,1sapp.com
 DOMAIN-SUFFIX,1shangbiao.com
 DOMAIN-SUFFIX,1shoucang.com
@@ -77960,7 +77951,6 @@ DOMAIN-SUFFIX,ubicdn.com
 DOMAIN-SUFFIX,ubiquant.com
 DOMAIN-SUFFIX,ubismartparcel.com
 DOMAIN-SUFFIX,ubixai.com
-DOMAIN-SUFFIX,ubixioe.com
 DOMAIN-SUFFIX,ublese.com
 DOMAIN-SUFFIX,ubmconlinereg.com
 DOMAIN-SUFFIX,ubmsinoexpo.com
@@ -87514,7 +87504,6 @@ DOMAIN-SUFFIX,yf520.com
 DOMAIN-SUFFIX,yf77.com
 DOMAIN-SUFFIX,yfa399.com
 DOMAIN-SUFFIX,yfanad.com
-DOMAIN-SUFFIX,yfanads.com
 DOMAIN-SUFFIX,yfanqie.com
 DOMAIN-SUFFIX,yfbudong.com
 DOMAIN-SUFFIX,yfbzb.com
