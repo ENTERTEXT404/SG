@@ -324,8 +324,16 @@ jobs:
           # 1.18.128.0/24: Korea Internet Security Agency (AS23596).
           # Use https://rdap.apnic.net/ip/<network-address> for registration and
           # https://stat.ripe.net/resource/<prefix> for route evidence.
-          # IPv6 registration for 2400:9380:8001::/48 and 2c0f:f7a8:9041::/48
-          # differs from the origin network. Review location evidence before excluding.
+          # IPv6 site assignments verified on 2026-11-22:
+          # APNIC records identify 8021 and 9020 as Singapore; 8040 as Japan;
+          # 9050 as South Korea; 9060 as Indonesia; 9071 as Malaysia; 9080 as Thailand.
+          # Registration can be checked at https://rdap.apnic.net/ip/2400:9380:8021::
+          # 2c0f:f7a8:9041::/48: AFRINIC's China Telecom South Africa allocation
+          # and the exact RADB route6 for AS23764 describe it as CTGNET Africa space.
+          # https://rdap.afrinic.net/rdap/ip/2c0f:f7a8:9041::
+          # https://www.radb.net/query?keywords=2c0f%3Af7a8%3A9041%3A%3A%2F48
+          # Retain 2400:9380:8001::/48 pending site evidence. Its APNIC address
+          # is the operator's Hong Kong office; public Atlas traces did not reach it.
           EXCLUSIONS = {
               4: (
                   "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
@@ -344,6 +352,9 @@ jobs:
               6: (
                   "::/128", "::1/128", "::ffff:0:0/96", "100::/64", "2001:2::/48",
                   "2001:db8::/32", "3fff::/20", "fc00::/7", "fe80::/10", "ff00::/8",
+                  "2400:9380:8021::/48", "2400:9380:8040::/48", "2400:9380:9020::/47",
+                  "2400:9380:9050::/47", "2400:9380:9060::/48", "2400:9380:9071::/48",
+                  "2400:9380:9080::/47", "2c0f:f7a8:9041::/48",
               ),
           }
           SIZE_HEADER = re.compile(r"^#\s*Size:\s*([0-9]+)\s*$")
