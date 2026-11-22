@@ -298,12 +298,16 @@ jobs:
           # https://www.iana.org/assignments/ipv6-multicast-addresses/
           #
           # APNIC registration and RIPE RIS routes verified on 2026-11-22.
-          # 14.227.96.0/20: Vietnam VNPT (AS45899).
+          # The listed 14.x prefixes are Vietnam VNPT (AS45899).
+          # 202.92.4.0/22 is registered in Vietnam and originated by VNPT (AS135905).
           # 223.122.0.0/16, 223.123.128.0/18, 223.123.192.0/20:
           # China Mobile Hong Kong (AS9231, AS137872).
           # 223.123.0.0/17: Pakistan CMPak (AS59257, AS138423).
           # https://ftp.apnic.net/stats/apnic/delegated-apnic-latest
-          # https://stat.ripe.net/resource/14.227.96.0/20
+          # https://rdap.apnic.net/ip/14.226.104.0
+          # https://stat.ripe.net/resource/AS45899
+          # https://rdap.apnic.net/ip/202.92.4.0
+          # https://stat.ripe.net/resource/202.92.4.0/22
           # https://stat.ripe.net/resource/223.122.0.0/15
           # Keep CMNET's 223.123.208.0/20 and 223.123.224.0/19.
           EXCLUSIONS = {
@@ -312,7 +316,10 @@ jobs:
                   "169.254.0.0/16", "172.16.0.0/12", "192.0.2.0/24", "192.168.0.0/16",
                   "198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24", "224.0.0.0/4",
                   "240.0.0.0/4",
-                  "14.227.96.0/20", "223.122.0.0/16", "223.123.0.0/17",
+                  "14.226.104.0/21", "14.226.168.0/21", "14.227.96.0/20",
+                  "14.227.192.0/20", "14.241.232.0/21", "14.255.16.0/24",
+                  "14.255.238.0/24", "14.255.254.0/24", "202.92.4.0/22",
+                  "223.122.0.0/16", "223.123.0.0/17",
                   "223.123.128.0/18", "223.123.192.0/20",
               ),
               6: (
