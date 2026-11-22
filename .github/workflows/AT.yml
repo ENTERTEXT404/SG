@@ -10,6 +10,7 @@ on:
     paths:
       - '.github/workflows/AT.yml'
       - 'RULE-SET/DIRECT.list'
+      - 'RULE-SET/GLOBAI.list'
       - 'RULE-SET/REJECT.list'
   workflow_dispatch:
     inputs:
@@ -578,24 +579,17 @@ jobs:
           RULE_SYNC_TARGET: REJECT
         run: *sync_rules
 
-  preview:
-    if: >-
-      github.event_name == 'workflow_dispatch' &&
-      (github.ref != format('refs/heads/{0}', github.event.repository.default_branch) ||
-      !inputs.publish)
-    runs-on: ubuntu-latest
-    timeout-minutes: 8
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Preview GLOBAI sync
+      - name: Verify GLOBAI rule set
         shell: bash
+        env:
+          GLOBAI_SYNC_MODE: check
         run: &sync_globai |
-          set --
-          if [[ "${GLOBAI_SYNC_MODE:-preview}" == "publish" ]]; then
-            set -- --write
-          fi
+          case "${GLOBAI_SYNC_MODE:-preview}" in
+            check) set -- --check ;;
+            preview) set -- ;;
+            publish) set -- --write ;;
+            *) echo 'Unknown GLOBAI sync mode' >&2; exit 1 ;;
+          esac
           python3 - "$@" <<'PYTHON'
           """Validate MagicRule GlobalAI for Surge and optionally update the SG mirror."""
           import argparse
@@ -617,7 +611,8 @@ jobs:
           ROOT = Path.cwd().resolve()
           TARGET = ROOT / "RULE-SET/GLOBAI.list"
           HOST_TYPES = ("DOMAIN", "DOMAIN-SUFFIX")
-          IP_TYPES = ("IP-CIDR", "IP-CIDR6", "IP-ASN")
+          CIDR_TYPES = ("IP-CIDR", "IP-CIDR6")
+          IP_TYPES = (*CIDR_TYPES, "IP-ASN")
           RULE_TYPES = (*HOST_TYPES, "DOMAIN-KEYWORD", "URL-REGEX", *IP_TYPES, "PROCESS-NAME")
           LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
           HOSTNAME = re.compile(rf"{LABEL}(?:\.{LABEL})+")
@@ -750,14 +745,38 @@ jobs:
               return any(".".join(labels[i:]) in suffixes for i in range(start, len(labels)))
 
 
+          def sort_key(rule):
+              kind, value, *_ = rule
+              if kind in HOST_TYPES:
+                  value = tuple(reversed(value.split(".")))
+              elif kind in CIDR_TYPES:
+                  value = ipaddress.ip_network(value)
+              elif kind == "IP-ASN":
+                  value = int(value)
+              return RULE_TYPES.index(kind), value
+
+
           def normalize(rules):
-              unique = list(dict.fromkeys(rules))
+              unique = set(rules)
               suffixes = {rule[1] for rule in unique if rule[0] == "DOMAIN-SUFFIX"}
               retained = [rule for rule in unique if not covered_by(rule, suffixes)]
-              hosts = sorted((rule for rule in retained if rule[0] in HOST_TYPES),
-                             key=lambda rule: (HOST_TYPES.index(rule[0]), tuple(reversed(rule[1].split(".")))))
-              other = [rule for rule in retained if rule[0] not in HOST_TYPES]
-              return hosts + other, len(rules) - len(unique), len(unique) - len(retained)
+              networks = {kind: [] for kind in CIDR_TYPES}
+              output = []
+              for rule in retained:
+                  kind, value, *_ = rule
+                  if kind in networks:
+                      networks[kind].append(ipaddress.ip_network(value))
+                  else:
+                      output.append(rule)
+              # All accepted CIDRs carry no-resolve. Collapse only within each family.
+              for kind, ranges in networks.items():
+                  output.extend((kind, str(net), "no-resolve") for net in ipaddress.collapse_addresses(ranges))
+              return (sorted(output, key=sort_key), len(rules) - len(unique),
+                      len(unique) - len(retained), len(retained) - len(output))
+
+
+          def render(rules):
+              return "".join(",".join(rule) + "\n" for rule in rules)
 
 
           def atomic_write(target, text):
@@ -775,15 +794,16 @@ jobs:
           def sync(write, show_diff):
               old_data = TARGET.read_bytes()
               old_text = old_data.decode("utf-8-sig")
-              old, _, _ = normalize(parse_rules(old_text, "Current GLOBAI.list"))
+              old, _, _, _ = normalize(parse_rules(old_text, "Current GLOBAI.list"))
               source = read_source()
-              rules, duplicates, covered = normalize(source)
+              rules, duplicates, covered, aggregated = normalize(source)
               added = len(set(rules) - set(old))
               removed = len(set(old) - set(rules))
               limit = max(1, len(old) // 10)
-              print(f"Upstream: {len(source)}; duplicates: {duplicates}; covered: {covered}; output: {len(rules)}")
+              print(f"Upstream: {len(source)}; duplicates: {duplicates}; covered domains: {covered}; "
+                    f"redundant or merged CIDRs: {aggregated}; output: {len(rules)}")
               print(f"Compared with normalized repository rules: +{added}, -{removed}")
-              candidate = "".join(",".join(rule) + "\n" for rule in rules)
+              candidate = render(rules)
               if old_data == candidate.encode("utf-8"):
                   print("GLOBAI.list is up to date.")
                   return
@@ -805,10 +825,18 @@ jobs:
               parser = argparse.ArgumentParser(description=__doc__)
               mode = parser.add_mutually_exclusive_group()
               mode.add_argument("--write", action="store_true", help="write RULE-SET/GLOBAI.list")
+              mode.add_argument("--check", action="store_true", help="validate the committed GLOBAI.list")
               mode.add_argument("--diff", action="store_true", help="preview changes against RULE-SET/GLOBAI.list")
               args = parser.parse_args()
               try:
-                  sync(args.write, args.diff)
+                  if args.check:
+                      current = TARGET.read_bytes()
+                      rules, _, _, _ = normalize(parse_rules(current.decode("utf-8-sig"), "Current GLOBAI.list"))
+                      if current != render(rules).encode("utf-8"):
+                          raise ValueError("GLOBAI.list is not canonical")
+                      print("GLOBAI.list contains canonical rule lines only.")
+                  else:
+                      sync(args.write, args.diff)
               except (ValueError, OSError, KeyError, TypeError, AttributeError) as error:
                   print(f"GlobalAI sync failed: {error}", file=sys.stderr)
                   return 1
@@ -818,6 +846,21 @@ jobs:
           if __name__ == "__main__":
               sys.exit(main())
           PYTHON
+
+  preview:
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      (github.ref != format('refs/heads/{0}', github.event.repository.default_branch) ||
+      !inputs.publish)
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Preview GLOBAI sync
+        shell: bash
+        run: *sync_globai
 
       - name: Preview REJECT sync
         if: ${{ !cancelled() }}
