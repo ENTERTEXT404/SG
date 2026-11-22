@@ -45,12 +45,13 @@ jobs:
           import argparse
           import ipaddress
           import json
-          from concurrent.futures import ThreadPoolExecutor
           from datetime import date, datetime, timedelta, timezone
           import re
           import sys
           from pathlib import Path
           from tempfile import NamedTemporaryFile
+          from time import sleep
+          from urllib.error import HTTPError
           from urllib.parse import urlencode, urlsplit
           from urllib.request import Request, urlopen
 
@@ -66,7 +67,7 @@ jobs:
           REJECT_SOURCE = ("https://raw.githubusercontent.com/TG-Twilight/AWAvenue-Ads-Rule/main/"
                            "Filters/AWAvenue-Ads-Rule-Surge-RULE-SET.list")
           MEASUREMENTS = "https://api.ooni.io/api/v1/measurements"
-          MAX_LOOKUPS = 24
+          MAX_LOOKUPS = 8
           HOST_TYPES = ("DOMAIN", "DOMAIN-SUFFIX")
           LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
           HOSTNAME = re.compile(rf"{LABEL}(?:\.{LABEL})*")
@@ -466,6 +467,9 @@ jobs:
               try:
                   response = json.loads(fetch(f"{MEASUREMENTS}?{params}", timeout=20))
                   return measurement_support(response["results"], host, since)
+              except HTTPError as error:
+                  print(f"OONI {host}: measurement lookup unavailable ({error})")
+                  return None if error.code == 429 else False
               except (OSError, ValueError, TypeError, AttributeError, KeyError) as error:
                   print(f"OONI {host}: measurement lookup unavailable ({error})")
                   return False
@@ -500,17 +504,21 @@ jobs:
               today = datetime.now(timezone.utc).date()
               if pending:
                   # Bound remote lookups and rotate the queue so large releases are revisited.
-                  offset = (today.toordinal() * MAX_LOOKUPS) % len(pending)
+                  offset = today.toordinal() % len(pending)
                   order = pending[offset:] + pending[:offset]
                   batch = order[:MAX_LOOKUPS]
                   since = today - timedelta(days=30)
-                  with ThreadPoolExecutor(max_workers=6) as pool:
-                      evidence = pool.map(lambda rule: mainland_evidence(rule[1], since), batch)
-                      for rule, supported in zip(batch, evidence):
-                          if supported:
-                              approved.add(rule)
-                          print(f"{'Accept' if supported else 'Skip'} {','.join(rule)}: "
-                                f"{'mainland measurement criteria met' if supported else 'insufficient mainland measurements'}")
+                  for index, rule in enumerate(batch):
+                      if index:
+                          sleep(1)
+                      supported = mainland_evidence(rule[1], since)
+                      if supported is None:
+                          print(f"Deferred {len(batch) - index} domains after OONI rate limiting")
+                          break
+                      if supported:
+                          approved.add(rule)
+                      print(f"{'Accept' if supported else 'Skip'} {','.join(rule)}: "
+                            f"{'mainland measurement criteria met' if supported else 'insufficient mainland measurements'}")
                   if len(order) > MAX_LOOKUPS:
                       print(f"Deferred {len(order) - MAX_LOOKUPS} new domains to a later lookup window")
               result = compact_hosts(retained | approved)
