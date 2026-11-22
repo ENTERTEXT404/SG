@@ -8,10 +8,9 @@ on:
       timezone: Asia/Shanghai
   pull_request:
     paths:
-      - '.github/scripts/sync_cidrcn.py'
       - '.github/workflows/AT.yml'
       - 'RULE-SET/CIDRCN.list'
-      - 'RULE-SET/DIRECT*.list'
+      - 'RULE-SET/DIRECT.list'
   workflow_dispatch:
     inputs:
       publish:
@@ -35,8 +34,320 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Verify generated DIRECT rule set
-        run: python3 .github/scripts/sync_cidrcn.py --check
+      - name: Verify generated CIDRCN block in DIRECT.list
+        shell: bash
+        env:
+          CIDRCN_SYNC_MODE: check
+        run: &sync_cidrcn |
+          python3 - "${CIDRCN_SYNC_MODE:-preview}" <<'PYTHON'
+          """Sync Sukka's CIDRs to CIDRCN.list and the generated block in DIRECT.list."""
+
+          import argparse
+          import ipaddress
+          import re
+          import sys
+          from pathlib import Path
+          from tempfile import NamedTemporaryFile
+          from urllib.request import Request, urlopen
+
+
+          RULE_SET = Path("RULE-SET")
+          CIDRCN = RULE_SET / "CIDRCN.list"
+          DIRECT = RULE_SET / "DIRECT.list"
+          SOURCES = {
+              4: "https://ruleset.skk.moe/List/ip/china_ip.conf",
+              6: "https://ruleset.skk.moe/List/ip/china_ip_ipv6.conf",
+          }
+          RULE_TYPES = {4: "IP-CIDR", 6: "IP-CIDR6"}
+          IP_VERSIONS = {kind: version for version, kind in RULE_TYPES.items()}
+          CIDRCN_MARKER = b"\n# BEGIN GENERATED CIDRCN - see .github/workflows/AT.yml\n"
+          CIDRCN_NOTICE = (
+              b"# CIDRCN data adapted from Sukka's Ruleset (https://github.com/SukkaW/Surge).\n"
+              b"# CIDRCN data license: CC BY-SA 2.0 (https://creativecommons.org/licenses/by-sa/2.0/).\n"
+              b"# Adaptations: filtering, deduplication, aggregation and sorting.\n"
+              b"\n"
+          )
+          MAX_BYTES = 2 * 1024 * 1024
+          MAX_CHANGE_PERCENT = 10
+
+          # CIDRCN.list adapts Sukka's Ruleset (https://github.com/SukkaW/Surge).
+          # License: CC BY-SA 2.0 (https://creativecommons.org/licenses/by-sa/2.0/).
+          # Adaptation: comment and non-CIDR removal, deduplication, aggregation,
+          # sorting and the exclusions below.
+          # The optional --sources IPV4 IPV6 flag uses local upstream snapshots.
+          #
+          # Special-use and multicast references:
+          # https://www.iana.org/assignments/iana-ipv4-special-registry
+          # https://www.iana.org/assignments/iana-ipv6-special-registry
+          # https://www.iana.org/assignments/multicast-addresses/
+          # https://www.iana.org/assignments/ipv6-multicast-addresses/
+          #
+          # APNIC registration and RIPE RIS routes verified on 2026-11-22.
+          # The listed 14.x prefixes are Vietnam VNPT (AS45899).
+          # 202.92.4.0/22 is registered in Vietnam and originated by VNPT (AS135905).
+          # 223.122.0.0/16, 223.123.128.0/18, 223.123.192.0/20:
+          # China Mobile Hong Kong (AS9231, AS137872).
+          # 223.123.0.0/17: Pakistan CMPak (AS59257, AS138423).
+          # https://ftp.apnic.net/stats/apnic/delegated-apnic-latest
+          # https://rdap.apnic.net/ip/14.226.104.0
+          # https://stat.ripe.net/resource/AS45899
+          # https://rdap.apnic.net/ip/202.92.4.0
+          # https://stat.ripe.net/resource/202.92.4.0/22
+          # https://stat.ripe.net/resource/223.122.0.0/15
+          # Keep CMNET's 223.123.208.0/20 and 223.123.224.0/19.
+          #
+          # Additional IPv4 exclusions cross-checked against APNIC RDAP and RIPE RIS:
+          # 117.134.192.0/18: CMPak (AS59257, AS138423), inside CMNET's 117.128.0.0/10.
+          # 103.143.92.0/23 and 202.75.248.0/22: China Telecom Macau (AS136167).
+          # 218.213.85.0/24 and 222.167.160.0/23: HKNet and HK Cable (AS9293, AS9908).
+          # 160.187.128.0/23: Lao Communication Technology (AS153347).
+          # 103.220.156.0/22: Microtel and Cityline India (AS135251, AS135746).
+          # 1.18.128.0/24: Korea Internet Security Agency (AS23596).
+          # Use https://rdap.apnic.net/ip/<network-address> for registration and
+          # https://stat.ripe.net/resource/<prefix> for route evidence.
+          # IPv6 site assignments verified on 2026-11-22:
+          # APNIC records identify 8021 and 9020 as Singapore; 8040 as Japan;
+          # 9050 as South Korea; 9060 as Indonesia; 9071 as Malaysia; 9080 as Thailand.
+          # Registration can be checked at https://rdap.apnic.net/ip/2400:9380:8021::
+          # 2c0f:f7a8:9041::/48: AFRINIC's China Telecom South Africa allocation
+          # and the exact RADB route6 for AS23764 describe it as CTGNET Africa space.
+          # https://rdap.afrinic.net/rdap/ip/2c0f:f7a8:9041::
+          # https://www.radb.net/query?keywords=2c0f%3Af7a8%3A9041%3A%3A%2F48
+          # Retain 2400:9380:8001::/48 pending site evidence. Its APNIC address
+          # is the operator's Hong Kong office; public Atlas traces did not reach it.
+          EXCLUSIONS = {
+              4: (
+                  "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
+                  "169.254.0.0/16", "172.16.0.0/12", "192.0.2.0/24", "192.168.0.0/16",
+                  "198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24", "224.0.0.0/4",
+                  "240.0.0.0/4",
+                  "14.226.104.0/21", "14.226.168.0/21", "14.227.96.0/20",
+                  "14.227.192.0/20", "14.241.232.0/21", "14.255.16.0/24",
+                  "14.255.238.0/24", "14.255.254.0/24", "202.92.4.0/22",
+                  "223.122.0.0/16", "223.123.0.0/17",
+                  "223.123.128.0/18", "223.123.192.0/20",
+                  "117.134.192.0/18", "103.143.92.0/23", "202.75.248.0/22",
+                  "218.213.85.0/24", "222.167.160.0/23", "160.187.128.0/23",
+                  "103.220.156.0/22", "1.18.128.0/24",
+              ),
+              6: (
+                  "::/128", "::1/128", "::ffff:0:0/96", "100::/64", "2001:2::/48",
+                  "2001:db8::/32", "3fff::/20", "fc00::/7", "fe80::/10", "ff00::/8",
+                  "2400:9380:8021::/48", "2400:9380:8040::/48", "2400:9380:9020::/47",
+                  "2400:9380:9050::/47", "2400:9380:9060::/48", "2400:9380:9071::/48",
+                  "2400:9380:9080::/47", "2c0f:f7a8:9041::/48",
+              ),
+          }
+          SIZE_HEADER = re.compile(r"^#\s*Size:\s*([0-9]+)\s*$")
+          COMMENT = re.compile(r"#|//|;")
+          UPSTREAM_MARKER = ["DOMAIN", "7h15.ru1353t.1s.m4d3.by.5ukk4w.skk.moe"]
+
+
+          def fetch(url):
+              request = Request(url, headers={"User-Agent": "SG-CIDRCN-Sync/1"})
+              with urlopen(request, timeout=30) as response:
+                  return response.read(MAX_BYTES + 1)
+
+
+          def parse_network(value, version):
+              if "%" in value or not re.search(r"/[0-9]+$", value):
+                  raise ValueError("expected a CIDR with a numeric prefix length")
+              network = ipaddress.ip_network(value)
+              if network.version != version or not network.prefixlen:
+                  raise ValueError(f"expected an IPv{version} network narrower than /0")
+              return network
+
+
+          def parse_rules(data, version, require_size):
+              if len(data) > MAX_BYTES:
+                  raise ValueError("source exceeds the size limit")
+
+              sizes = []
+              valid = []
+              total = 0
+              for number, raw in enumerate(data.decode("utf-8-sig").splitlines(), 1):
+                  if match := SIZE_HEADER.fullmatch(raw.strip()):
+                      sizes.append(int(match[1]))
+                  line = COMMENT.split(raw, maxsplit=1)[0].strip()
+                  if not line:
+                      continue
+                  total += 1
+                  fields = [field.strip() for field in line.split(",")]
+                  if fields == UPSTREAM_MARKER:
+                      continue
+                  try:
+                      if len(fields) == 1:
+                          value = fields[0]
+                      elif (fields[0] == RULE_TYPES[version] and
+                            (len(fields) == 2 or fields[2:] == ["no-resolve"])):
+                          # Match the published list's existing DNS behavior.
+                          value = fields[1]
+                      else:
+                          raise ValueError("unexpected rule type, policy or option")
+                      valid.append(parse_network(value, version))
+                  except ValueError as error:
+                      raise ValueError(f"line {number}: {error}") from error
+
+              if (require_size or sizes) and sizes != [total]:
+                  raise ValueError(f"source size header disagrees with the {total} rule lines")
+              if not valid:
+                  raise ValueError("source has no valid CIDRs for this address family")
+              return valid, total - len(valid)
+
+
+          def subtract(network, excluded):
+              if not network.overlaps(excluded):
+                  return (network,)
+              if network.subnet_of(excluded):
+                  return ()
+              return network.address_exclude(excluded)
+
+
+          def build_rules(data, version, require_size):
+              valid, ignored = parse_rules(data, version, require_size)
+              unique = set(valid)
+              upstream = list(ipaddress.collapse_addresses(unique))
+              networks = upstream
+              for cidr in EXCLUSIONS[version]:
+                  excluded = ipaddress.ip_network(cidr)
+                  networks = [part for network in networks for part in subtract(network, excluded)]
+              if not networks:
+                  raise ValueError("no CIDRs remain after exclusions")
+
+              result = sorted(ipaddress.collapse_addresses(networks))
+              excluded_addresses = sum(net.num_addresses for net in upstream) - sum(
+                  net.num_addresses for net in result
+              )
+              print(
+                  f"IPv{version}: {len(valid)} valid, {ignored} ignored, "
+                  f"{len(valid) - len(unique)} duplicates, {len(unique) - len(upstream)} "
+                  f"redundant or merged, {excluded_addresses} excluded addresses, "
+                  f"{len(result)} published CIDRs"
+              )
+              return result
+
+
+          def read_baseline(path):
+              all_networks = {version: [] for version in RULE_TYPES}
+              for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                  kind, _, value = line.partition(",")
+                  try:
+                      version = IP_VERSIONS[kind]
+                      all_networks[version].append(parse_network(value, version))
+                  except (KeyError, ValueError) as error:
+                      raise ValueError(f"invalid baseline rule at {path}:{number}") from error
+              if any(not networks for networks in all_networks.values()):
+                  raise ValueError(f"{path} must contain both address families")
+              return all_networks
+
+
+          def validate_change(old, new, version):
+              old_count = len(old)
+              new_count = len(new)
+              old_size = sum(n.num_addresses for n in ipaddress.collapse_addresses(old))
+              new_size = sum(n.num_addresses for n in new)
+              union_size = sum(n.num_addresses for n in ipaddress.collapse_addresses(old + new))
+              added = union_size - old_size
+              removed = union_size - new_size
+              print(f"IPv{version} vs published: {old_count} -> {new_count} CIDRs, "
+                    f"+{added:,} / -{removed:,} addresses")
+              if ((old_count - new_count) * 100 > old_count * MAX_CHANGE_PERCENT or
+                  max(added, removed) * 100 > old_size * MAX_CHANGE_PERCENT):
+                  raise ValueError(f"IPv{version} changed more than the {MAX_CHANGE_PERCENT}% "
+                                   "safety limit. Review upstream before publishing")
+
+
+          def write_if_changed(target, data):
+              if target.exists() and target.read_bytes() == data:
+                  print(f"{target.name} is up to date.")
+                  return
+
+              mode = target.stat().st_mode & 0o777 if target.exists() else 0o644
+              with NamedTemporaryFile(dir=target.parent, delete=False) as temporary:
+                  path = Path(temporary.name)
+                  try:
+                      temporary.write(data)
+                      temporary.close()
+                      path.chmod(mode)
+                      path.replace(target)
+                  finally:
+                      path.unlink(missing_ok=True)
+              print(f"Updated {target.name}.")
+
+
+          def sync_networks(baseline, sources):
+              result = {}
+              for index, (version, url) in enumerate(SOURCES.items()):
+                  source = sources[index] if sources else url
+                  try:
+                      data = source.read_bytes() if sources else fetch(source)
+                      networks = build_rules(data, version, require_size=not sources)
+                      validate_change(baseline[version], networks, version)
+                      result[version] = networks
+                  except (OSError, ValueError) as error:
+                      raise ValueError(f"IPv{version} {source}: {error}") from error
+              return result
+
+
+          def render_cidrcn(networks):
+              return "".join(
+                  f"{RULE_TYPES[version]},{network}\n"
+                  for version, ranges in networks.items()
+                  for network in ranges
+              ).encode("utf-8")
+
+
+          def read_direct_prefix(cached):
+              prefix, marker, generated = DIRECT.read_bytes().partition(CIDRCN_MARKER)
+              if not marker:
+                  raise ValueError("DIRECT.list is missing its generated CIDRCN marker")
+              if generated != CIDRCN_NOTICE + cached:
+                  raise ValueError("DIRECT.list CIDRCN block differs from CIDRCN.list. "
+                                   "Keep manual rules above the generated marker.")
+              return prefix + marker + CIDRCN_NOTICE
+
+
+          def main():
+              parser = argparse.ArgumentParser(description=__doc__)
+              parser.add_argument("mode", choices=("check", "preview", "publish"))
+              parser.add_argument(
+                  "--sources", nargs=2, type=Path, metavar=("IPV4", "IPV6"),
+                  help="use local source snapshots in place of downloads",
+              )
+              args = parser.parse_args()
+              if args.mode == "check" and args.sources:
+                  parser.error("check uses only the committed files")
+
+              try:
+                  baseline = read_baseline(CIDRCN)
+                  cached = render_cidrcn(baseline)
+                  if CIDRCN.read_bytes() != cached or any(
+                      ranges != sorted(ipaddress.collapse_addresses(ranges))
+                      for ranges in baseline.values()
+                  ):
+                      raise ValueError("CIDRCN.list is not sorted, canonical and aggregated")
+                  direct_prefix = read_direct_prefix(cached)
+                  if args.mode == "check":
+                      print("DIRECT.list generated CIDRCN block matches CIDRCN.list.")
+                      return 0
+
+                  cidrcn = render_cidrcn(sync_networks(baseline, args.sources))
+                  outputs = ((CIDRCN, cidrcn), (DIRECT, direct_prefix + cidrcn))
+                  for target, data in outputs:
+                      if args.mode == "publish":
+                          write_if_changed(target, data)
+                      else:
+                          state = "is up to date" if target.read_bytes() == data else "would change"
+                          print(f"{target.name} {state}.")
+              except (OSError, ValueError) as error:
+                  print(f"CIDRCN / DIRECT sync failed: {error}", file=sys.stderr)
+                  return 1
+              return 0
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PYTHON
 
   preview:
     if: >-
@@ -280,7 +591,7 @@ jobs:
           PYTHON
 
       - name: Preview CIDRCN and DIRECT sync
-        run: python3 .github/scripts/sync_cidrcn.py --preview
+        run: *sync_cidrcn
 
   publish:
     if: >-
@@ -335,7 +646,10 @@ jobs:
             echo "- Started: $(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S %Z')"
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Generate CIDRCN and DIRECT rule sets
-        run: python3 .github/scripts/sync_cidrcn.py
+        shell: bash
+        env:
+          CIDRCN_SYNC_MODE: publish
+        run: *sync_cidrcn
       - name: Commit and push CIDRCN and DIRECT changes
         run: |
           git add -- RULE-SET/CIDRCN.list RULE-SET/DIRECT.list
