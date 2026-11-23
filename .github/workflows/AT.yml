@@ -1,14 +1,9 @@
 name: AT
-run-name: >-
-  ${{ (github.event.schedule == '30 0 * * *' && 'AT scheduled 08:30 (Asia/Shanghai)') ||
-      (github.event.schedule == '45 0 * * *' && 'AT retry 08:45 (Asia/Shanghai)') ||
-      (github.event.schedule == '15 4 * * *' && 'AT catch-up 12:15 (Asia/Shanghai)') || 'AT' }}
+run-name: ${{ github.event_name == 'schedule' && 'AT scheduled rule sync' || 'AT' }}
 
 on:
   schedule:
-    - cron: '30 0 * * *' # 08:30 Asia/Shanghai
-    - cron: '45 0 * * *' # 08:45 Asia/Shanghai, retry unfinished rule sets
-    - cron: '15 4 * * *' # 12:15 Asia/Shanghai, catch up after missed morning runs
+    - cron: '30 0,8,16 * * *' # 00:30, 08:30 and 16:30 in Asia/Shanghai
   pull_request:
     paths:
       - '.github/workflows/AT.yml'
@@ -890,87 +885,11 @@ jobs:
         shell: bash
         run: *sync_rules
 
-  plan-retry:
-    if: >-
-      github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
-      github.event_name == 'schedule' &&
-      (github.event.schedule == '45 0 * * *' || github.event.schedule == '15 4 * * *')
-    runs-on: ubuntu-latest
-    timeout-minutes: 3
-    permissions:
-      actions: read
-    outputs:
-      globai_done: ${{ steps.history.outputs.globai_done }}
-      reject_done: ${{ steps.history.outputs.reject_done }}
-      direct_done: ${{ steps.history.outputs.direct_done }}
-    steps:
-      - name: Find successful jobs from today's scheduled runs
-        id: history
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          python3 - <<'PYTHON'
-          from datetime import datetime, timedelta, timezone
-          import json
-          from os import environ
-          from pathlib import Path
-          from urllib.parse import urlencode
-          from urllib.request import Request, urlopen
-          from zoneinfo import ZoneInfo
-
-          JOBS = {"publish": "globai_done", "publish-reject": "reject_done", "publish-direct": "direct_done"}
-
-
-          def read_api(path, **params):
-              base = f"{environ['GITHUB_API_URL']}/repos/{environ['GITHUB_REPOSITORY']}"
-              url = f"{base}/actions/{path}?{urlencode(params)}"
-              request = Request(url, headers={
-                  "Accept": "application/vnd.github+json",
-                  "Authorization": f"Bearer {environ['GH_TOKEN']}",
-                  "X-GitHub-Api-Version": "2022-11-28",
-              })
-              with urlopen(request, timeout=12) as response:
-                  return json.load(response)
-
-
-          def successful_jobs(read, run_id, branch):
-              current = read(f"runs/{run_id}")
-              local = datetime.fromisoformat(current["created_at"].replace("Z", "+00:00")).astimezone(
-                  ZoneInfo("Asia/Shanghai")
-              )
-              start = local.replace(hour=0, minute=0, second=0, microsecond=0)
-              stop = start + timedelta(days=1)
-              created = "..".join(t.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") for t in (start, stop))
-              runs = read(f"workflows/{current['workflow_id']}/runs", branch=branch, event="schedule",
-                          created=created, per_page=100)["workflow_runs"]
-              successful = set()
-              for run in runs:
-                  created_at = datetime.fromisoformat(run["created_at"].replace("Z", "+00:00"))
-                  if run["id"] == run_id or not start <= created_at < stop:
-                      continue
-                  jobs = read(f"runs/{run['id']}/jobs", filter="all", per_page=100)["jobs"]
-                  successful.update(job["name"] for job in jobs if job["conclusion"] == "success")
-              return successful & JOBS.keys()
-
-
-          try:
-              done = successful_jobs(read_api, int(environ["GITHUB_RUN_ID"]), environ["GITHUB_REF_NAME"])
-          except (OSError, ValueError, TypeError, KeyError) as error:
-              print(f"::warning::Could not check prior sync results. Retrying all rule sets ({error}).")
-              done = set()
-          with Path(environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
-              for job, result in JOBS.items():
-                  print(f"{result}={str(job in done).lower()}", file=output)
-          print("Already successful: " + (", ".join(sorted(done)) or "none"))
-          PYTHON
-
   publish:
-    needs: plan-retry
     if: >-
       !cancelled() &&
       github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
-      ((github.event_name == 'schedule' && needs.plan-retry.outputs.globai_done != 'true') ||
+      (github.event_name == 'schedule' ||
       (github.event_name == 'workflow_dispatch' && inputs.publish))
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -997,11 +916,11 @@ jobs:
           git push origin "HEAD:${GITHUB_REF}"
 
   publish-reject:
-    needs: [plan-retry, publish]
+    needs: publish
     if: >-
       !cancelled() &&
       github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
-      ((github.event_name == 'schedule' && needs.plan-retry.outputs.reject_done != 'true') ||
+      (github.event_name == 'schedule' ||
       (github.event_name == 'workflow_dispatch' && inputs.publish))
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -1029,11 +948,11 @@ jobs:
           git push origin "HEAD:${GITHUB_REF}"
 
   publish-direct:
-    needs: [plan-retry, publish-reject]
+    needs: publish-reject
     if: >-
       !cancelled() &&
       github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
-      ((github.event_name == 'schedule' && needs.plan-retry.outputs.direct_done != 'true') ||
+      (github.event_name == 'schedule' ||
       (github.event_name == 'workflow_dispatch' && inputs.publish))
     runs-on: ubuntu-latest
     timeout-minutes: 8
