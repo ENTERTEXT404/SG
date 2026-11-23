@@ -45,6 +45,7 @@ jobs:
           import ipaddress
           import json
           from datetime import date, datetime, timedelta, timezone
+          from os import getenv
           import re
           import sys
           from pathlib import Path
@@ -62,6 +63,10 @@ jobs:
           DOMAIN_ROOT = "https://raw.githubusercontent.com/Loyalsoldier/surge-rules"
           # Per-file floors catch truncated small sources that the combined change limit could miss.
           DOMAIN_MINIMUMS = {"direct": 90_000, "private": 100, "apple": 125, "icloud": 40}
+          SOURCES = {
+              4: "https://ruleset.skk.moe/List/ip/china_ip.conf",
+              6: "https://ruleset.skk.moe/List/ip/china_ip_ipv6.conf",
+          }
           DIRECT_EXTRAS = set()  # Add reviewed (rule_type, domain) pairs here.
           REJECT_SOURCE = ("https://raw.githubusercontent.com/TG-Twilight/AWAvenue-Ads-Rule/main/"
                            "Filters/AWAvenue-Ads-Rule-Surge-RULE-SET.list")
@@ -71,10 +76,6 @@ jobs:
           LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
           HOSTNAME = re.compile(rf"{LABEL}(?:\.{LABEL})*")
           KEYWORD = re.compile(r"[A-Za-z0-9._-]+")
-          SOURCES = {
-              4: "https://ruleset.skk.moe/List/ip/china_ip.conf",
-              6: "https://ruleset.skk.moe/List/ip/china_ip_ipv6.conf",
-          }
           RULE_TYPES = {4: "IP-CIDR", 6: "IP-CIDR6"}
           IP_VERSIONS = {kind: version for version, kind in RULE_TYPES.items()}
           MAX_BYTES = 2 * 1024 * 1024
@@ -237,7 +238,7 @@ jobs:
                   f"redundant or merged, {excluded_addresses} excluded addresses, "
                   f"{len(result)} published CIDRs"
               )
-              return result
+              return result, len(valid)
 
 
           def read_direct(data):
@@ -294,14 +295,18 @@ jobs:
               print(f"Updated {target.name}.")
 
 
-          def sync_networks(baseline, sources):
+          def sync_networks(baseline, sources, source_report):
               result = {}
               for index, (version, url) in enumerate(SOURCES.items()):
                   source = sources[index] if sources else url
                   try:
+                      source_report[version] = ("读取失败" if sources else "拉取失败", None, None)
                       data = source.read_bytes() if sources else fetch(source)
-                      networks = build_rules(data, version, require_size=not sources)
+                      source_report[version] = ("已读取 · 内容校验失败", None, None)
+                      networks, count = build_rules(data, version, require_size=not sources)
+                      source_report[version] = ("已读取 · 变动校验未通过", count, None)
                       validate_change(baseline[version], networks, version)
+                      source_report[version] = ("校验通过", count, None)
                       result[version] = networks
                   except (OSError, ValueError) as error:
                       raise ValueError(f"IPv{version} {source}: {error}") from error
@@ -360,19 +365,27 @@ jobs:
                   raise ValueError(f"{label} exceeds its {limit:,}-rule change limit")
 
 
-          def fetch_domains():
+          def fetch_domains(source_report):
+              for source in DOMAIN_MINIMUMS:
+                  source_report[source] = ("上游版本读取失败", None, None)
               ref = json.loads(fetch(DOMAIN_REF, 64 * 1024))["object"]["sha"]
               if not re.fullmatch(r"[0-9a-f]{40}", ref):
                   raise ValueError("invalid Loyalsoldier release commit")
+              for source in DOMAIN_MINIMUMS:
+                  source_report[source] = ("未执行", None, ref)
               source_rules = {}
               for source, minimum in DOMAIN_MINIMUMS.items():
+                  source_report[source] = ("拉取失败", None, ref)
                   data = fetch(f"{DOMAIN_ROOT}/{ref}/ruleset/{source}.txt", 6 * 1024 * 1024)
+                  source_report[source] = ("已读取 · 内容校验失败", None, ref)
                   try:
                       rules = {parse_host(*line.split(",", 1)) for _, line in checked_lines(data)}
                   except (TypeError, ValueError) as error:
                       raise ValueError(f"{source}.txt: expected DOMAIN or DOMAIN-SUFFIX") from error
                   if len(rules) < minimum:
+                      source_report[source] = ("已读取 · 数量低于下限", len(rules), ref)
                       raise ValueError(f"{source}.txt has only {len(rules)} rules. Expected at least {minimum}")
+                  source_report[source] = ("校验通过", len(rules), ref)
                   source_rules[source] = rules
                   print(f"{source}.txt @ {ref[:12]}: {len(rules):,} unique domain rules")
               return source_rules
@@ -465,13 +478,13 @@ jobs:
                                     since=since.isoformat(), limit=30))
               try:
                   response = json.loads(fetch(f"{MEASUREMENTS}?{params}", timeout=20))
-                  return measurement_support(response["results"], host, since)
+                  return "supported" if measurement_support(response["results"], host, since) else "insufficient"
               except HTTPError as error:
                   print(f"OONI {host}: measurement lookup unavailable ({error})")
-                  return None if error.code == 429 else False
+                  return "rate_limited" if error.code == 429 else "unavailable"
               except (OSError, ValueError, TypeError, AttributeError, KeyError) as error:
                   print(f"OONI {host}: measurement lookup unavailable ({error})")
-                  return False
+                  return "unavailable"
 
 
           def fully_rejected(rule, reject_hosts, reject_parents, reject_keywords):
@@ -487,9 +500,10 @@ jobs:
               return rules - excluded, excluded
 
 
-          def sync_domains(old, reject):
-              sources = fetch_domains()
+          def sync_domains(old, reject, source_report, filter_report):
+              sources = fetch_domains(source_report)
               incoming = set().union(*sources.values(), DIRECT_EXTRAS)
+              new_candidates = len(incoming - old)
               parents = suffixes(incoming)
               # Check old and new rules before compacting. A narrower REJECT rule
               # cannot remove an entire DIRECT suffix or its other subdomains.
@@ -503,17 +517,24 @@ jobs:
               tracked_changes("DIRECT existing domains", old, retained)
               retained_parents = suffixes(retained)
               approved, pending = set(), []
+              covered = skipped = preapproved = 0
               for rule in sorted(incoming - retained):
                   kind, name = rule
                   if in_suffix(rule, retained_parents):
+                      covered += 1
                       continue
                   if rule in sources["private"] or rule in DIRECT_EXTRAS:
+                      preapproved += 1
                       approved.add(rule)
                       print(f"Accept {kind},{name}: private or explicitly maintained")
                   elif kind == "DOMAIN" and "." in name:
                       pending.append(rule)
                   else:
+                      skipped += 1
                       print(f"Skip {kind},{name}: no evidence for the entire suffix")
+              outcomes = dict.fromkeys(("supported", "insufficient", "unavailable"), 0)
+              deferred = len(pending)
+              rate_limited = False
               today = datetime.now(timezone.utc).date()
               if pending:
                   # Bound remote lookups and rotate the queue so large releases are revisited.
@@ -524,19 +545,64 @@ jobs:
                   for index, rule in enumerate(batch):
                       if index:
                           sleep(1)
-                      supported = mainland_evidence(rule[1], since)
-                      if supported is None:
+                      outcome = mainland_evidence(rule[1], since)
+                      if outcome == "rate_limited":
+                          rate_limited = True
                           print(f"Deferred {len(batch) - index} domains after OONI rate limiting")
                           break
-                      if supported:
+                      deferred -= 1
+                      outcomes[outcome] += 1
+                      if outcome == "supported":
                           approved.add(rule)
-                      print(f"{'Accept' if supported else 'Skip'} {','.join(rule)}: "
-                            f"{'mainland measurement criteria met' if supported else 'insufficient mainland measurements'}")
+                          detail = "mainland measurement criteria met"
+                      elif outcome == "unavailable":
+                          detail = "mainland measurement lookup unavailable"
+                      else:
+                          detail = "insufficient mainland measurements"
+                      print(f"{'Accept' if outcome == 'supported' else 'Skip'} {','.join(rule)}: {detail}")
                   if len(order) > MAX_LOOKUPS:
                       print(f"Deferred {len(order) - MAX_LOOKUPS} new domains to a later lookup window")
               result = compact_hosts(retained | approved)
               tracked_changes("DIRECT published domains", old, result)
+              filter_report.update({
+                  "未出现在现有名单的域名规则（去重后）": new_candidates,
+                  "被 REJECT 覆盖（含现有规则）": len(conflicts),
+                  "已被保留的直连后缀覆盖": covered,
+                  "私有域名或手工规则直接通过": preapproved,
+                  "通过大陆连通性检查": outcomes["supported"],
+                  "大陆连通性证据不足": outcomes["insufficient"],
+                  "测量服务查询失败": outcomes["unavailable"],
+                  "缺少整段后缀的连通性证据": skipped,
+                  "待后续检查" + ("（本次遇到测量服务限流）" if rate_limited else ""): deferred,
+                  "筛选后拟新增的域名规则": len(result - old),
+              })
               return result
+
+
+          def show_direct_report(path, source_report, filter_report, local_sources):
+              with Path(path).open("a", encoding="utf-8") as summary:
+                  print("### DIRECT.list · 上游状态\n", file=summary)
+                  print("| 上游 | 结果 | 读取规则数 | 上游版本 |", file=summary)
+                  print("| --- | --- | ---: | --- |", file=summary)
+                  for source, (status, count, ref) in source_report.items():
+                      if source in SOURCES:
+                          provider = "本地快照" if local_sources else "Sukka"
+                          name = f"{provider} · IPv{source}"
+                      else:
+                          name = f"Loyalsoldier · {source}.txt"
+                      count_text = f"{count:,}" if count is not None else "—"
+                      version = f"`{ref[:12]}`" if ref else "—"
+                      print(f"| {name} | {status} | {count_text} | {version} |", file=summary)
+                  print("\n域名按各来源内去重后统计。IP 按通过解析的网段统计，尚未合并或排除。\n",
+                        file=summary)
+                  print("### DIRECT.list · 域名筛选结果\n", file=summary)
+                  if not filter_report:
+                      print("本次未完成域名筛选，请查看上游状态和任务日志。\n", file=summary)
+                      return
+                  print("| 项目 | 条数 |\n| --- | ---: |", file=summary)
+                  for label, count in filter_report.items():
+                      print(f"| {label} | {count:,} |", file=summary)
+                  print("\n这里统计候选规则。实际发布结果见同步摘要。\n", file=summary)
 
 
           def main():
@@ -551,14 +617,17 @@ jobs:
               if args.sources and (args.mode == "check" or args.target != "DIRECT"):
                   parser.error("--sources is only for DIRECT preview or publish")
               target = DIRECT if args.target == "DIRECT" else REJECT
+              summary = getenv("GITHUB_STEP_SUMMARY") if target == DIRECT and args.mode != "check" else None
+              source_report = dict.fromkeys((*DOMAIN_MINIMUMS, *SOURCES), ("未执行", None, None))
+              filter_report = {}
 
               try:
                   current = target.read_bytes()
                   if target == DIRECT:
                       domains, baseline = read_direct(current)
                       if args.mode != "check":
-                          domains = sync_domains(domains, REJECT.read_bytes())
-                          baseline = sync_networks(baseline, args.sources)
+                          domains = sync_domains(domains, REJECT.read_bytes(), source_report, filter_report)
+                          baseline = sync_networks(baseline, args.sources, source_report)
                       candidate = render_hosts(compact_hosts(domains)) + render_cidrcn(baseline)
                   elif args.mode == "check":
                       candidate = render_reject(normalize_reject(parse_reject(current)))
@@ -577,6 +646,12 @@ jobs:
               except (OSError, ValueError, TypeError, KeyError) as error:
                   print(f"{target.name} sync failed: {error}", file=sys.stderr)
                   return 1
+              finally:
+                  if summary:
+                      try:
+                          show_direct_report(summary, source_report, filter_report, args.sources)
+                      except OSError as error:
+                          print(f"Could not write DIRECT sync summary: {error}", file=sys.stderr)
               return 0
 
 
