@@ -1,14 +1,14 @@
 name: AT
 run-name: >-
-  ${{ (github.event.schedule == '30 8 * * *' && 'AT scheduled 08:30 (Asia/Shanghai)') ||
-      (github.event.schedule == '45 8 * * *' && 'AT retry 08:45 (Asia/Shanghai)') || 'AT' }}
+  ${{ (github.event.schedule == '30 0 * * *' && 'AT scheduled 08:30 (Asia/Shanghai)') ||
+      (github.event.schedule == '45 0 * * *' && 'AT retry 08:45 (Asia/Shanghai)') ||
+      (github.event.schedule == '15 4 * * *' && 'AT catch-up 12:15 (Asia/Shanghai)') || 'AT' }}
 
 on:
   schedule:
-    - cron: '30 8 * * *'
-      timezone: Asia/Shanghai
-    - cron: '45 8 * * *' # Retry rule sets without a successful run today
-      timezone: Asia/Shanghai
+    - cron: '30 0 * * *' # 08:30 Asia/Shanghai
+    - cron: '45 0 * * *' # 08:45 Asia/Shanghai, retry unfinished rule sets
+    - cron: '15 4 * * *' # 12:15 Asia/Shanghai, catch up after missed morning runs
   pull_request:
     paths:
       - '.github/workflows/AT.yml'
@@ -893,7 +893,8 @@ jobs:
   plan-retry:
     if: >-
       github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
-      github.event_name == 'schedule' && github.event.schedule == '45 8 * * *'
+      github.event_name == 'schedule' &&
+      (github.event.schedule == '45 0 * * *' || github.event.schedule == '15 4 * * *')
     runs-on: ubuntu-latest
     timeout-minutes: 3
     permissions:
