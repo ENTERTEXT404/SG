@@ -42,6 +42,7 @@ jobs:
           """Generate validated Surge DIRECT and REJECT rule sets."""
 
           import argparse
+          from http.client import IncompleteRead
           import ipaddress
           import json
           from datetime import date, datetime, timedelta, timezone
@@ -51,7 +52,7 @@ jobs:
           from pathlib import Path
           from tempfile import NamedTemporaryFile
           from time import sleep
-          from urllib.error import HTTPError
+          from urllib.error import HTTPError, URLError
           from urllib.parse import urlencode, urlsplit
           from urllib.request import Request, urlopen
 
@@ -154,10 +155,23 @@ jobs:
           UPSTREAM_MARKER = ["DOMAIN", "7h15.ru1353t.1s.m4d3.by.5ukk4w.skk.moe"]
 
 
-          def fetch(url, limit=MAX_BYTES, timeout=30):
+          def fetch(url, limit=MAX_BYTES, timeout=30, *, retry=True):
               request = Request(url, headers={"User-Agent": "SG-Rule-Sync/1"})
-              with urlopen(request, timeout=timeout) as response:
-                  data = response.read(limit + 1)
+              for attempt in range(2):
+                  try:
+                      with urlopen(request, timeout=timeout) as response:
+                          data = response.read(limit + 1)
+                      break
+                  except (URLError, ConnectionError, TimeoutError, IncompleteRead) as error:
+                      reason = error.reason if isinstance(error, URLError) else error
+                      temporary = (
+                          error.code in (408, 500, 502, 503, 504) if isinstance(error, HTTPError)
+                          else isinstance(reason, (ConnectionError, TimeoutError, IncompleteRead))
+                      )
+                      if not retry or attempt or not temporary:
+                          raise
+                      print(f"Temporary download failure, retrying in 3 seconds: {url} ({error})")
+                      sleep(3)
               if len(data) > limit:
                   raise ValueError(f"response exceeds the size limit: {url}")
               return data
@@ -477,7 +491,7 @@ jobs:
               params = urlencode(dict(probe_cc="CN", test_name="web_connectivity", domain=host,
                                     since=since.isoformat(), limit=30))
               try:
-                  response = json.loads(fetch(f"{MEASUREMENTS}?{params}", timeout=20))
+                  response = json.loads(fetch(f"{MEASUREMENTS}?{params}", timeout=20, retry=False))
                   return "supported" if measurement_support(response["results"], host, since) else "insufficient"
               except HTTPError as error:
                   print(f"OONI {host}: measurement lookup unavailable ({error})")
@@ -579,7 +593,7 @@ jobs:
               return result
 
 
-          def show_direct_report(path, source_report, filter_report, local_sources):
+          def show_direct_report(path, source_report, filter_report, local_sources, reject_basis):
               with Path(path).open("a", encoding="utf-8") as summary:
                   print("### DIRECT.list · 上游状态\n", file=summary)
                   print("| 上游 | 结果 | 读取规则数 | 上游版本 |", file=summary)
@@ -596,6 +610,8 @@ jobs:
                   print("\n域名按各来源内去重后统计。IP 按通过解析的网段统计，尚未合并或排除。\n",
                         file=summary)
                   print("### DIRECT.list · 域名筛选结果\n", file=summary)
+                  if reject_basis:
+                      print(f"拦截检查使用{reject_basis}。\n", file=summary)
                   if not filter_report:
                       print("本次未完成域名筛选，请查看上游状态和任务日志。\n", file=summary)
                       return
@@ -620,13 +636,25 @@ jobs:
               summary = getenv("GITHUB_STEP_SUMMARY") if target == DIRECT and args.mode != "check" else None
               source_report = dict.fromkeys((*DOMAIN_MINIMUMS, *SOURCES), ("未执行", None, None))
               filter_report = {}
+              runner_temp = getenv("RUNNER_TEMP")
+              preview_reject = (Path(runner_temp) / "sg-preview-reject.list"
+                                if args.mode == "preview" and runner_temp else None)
+              reject_outcome = getenv("RULE_SYNC_REJECT_OUTCOME")
+              reject_basis = None
 
               try:
                   current = target.read_bytes()
                   if target == DIRECT:
                       domains, baseline = read_direct(current)
                       if args.mode != "check":
-                          domains = sync_domains(domains, REJECT.read_bytes(), source_report, filter_report)
+                          reject_path = REJECT
+                          reject_basis = "仓库中的 REJECT.list"
+                          if preview_reject is not None and reject_outcome == "success":
+                              reject_path = preview_reject
+                              reject_basis = "本轮预览生成的 REJECT.list"
+                          elif reject_outcome and reject_outcome != "success":
+                              reject_basis += "（本轮 REJECT 同步未成功）"
+                          domains = sync_domains(domains, reject_path.read_bytes(), source_report, filter_report)
                           baseline = sync_networks(baseline, args.sources, source_report)
                       candidate = render_hosts(compact_hosts(domains)) + render_cidrcn(baseline)
                   elif args.mode == "check":
@@ -641,6 +669,8 @@ jobs:
                   elif args.mode == "publish":
                       write_if_changed(target, candidate)
                   else:
+                      if target == REJECT and preview_reject is not None:
+                          write_if_changed(preview_reject, candidate)
                       state = "is up to date" if current == candidate else "would change"
                       print(f"{target.name} {state}.")
               except (OSError, ValueError, TypeError, KeyError) as error:
@@ -649,7 +679,7 @@ jobs:
               finally:
                   if summary:
                       try:
-                          show_direct_report(summary, source_report, filter_report, args.sources)
+                          show_direct_report(summary, source_report, filter_report, args.sources, reject_basis)
                       except OSError as error:
                           print(f"Could not write DIRECT sync summary: {error}", file=sys.stderr)
               return 0
@@ -683,12 +713,15 @@ jobs:
           from collections import Counter
           from difflib import unified_diff
           from hashlib import sha256
+          from http.client import IncompleteRead
           import ipaddress
           import json
           from pathlib import Path
           import re
           import sys
           from tempfile import NamedTemporaryFile
+          from time import sleep
+          from urllib.error import HTTPError, URLError
           from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 
@@ -719,10 +752,24 @@ jobs:
 
           def fetch(url):
               request = Request(url, headers={"User-Agent": "SG-GlobalAI-Sync/1"})
-              with build_opener(NoRedirect).open(request, timeout=30) as response:
-                  if response.status != 200:
-                      raise ValueError(f"Expected HTTP 200, received {response.status}")
-                  data = response.read(MAX_RESPONSE_BYTES + 1)
+              opener = build_opener(NoRedirect)
+              for attempt in range(2):
+                  try:
+                      with opener.open(request, timeout=30) as response:
+                          if response.status != 200:
+                              raise ValueError(f"Expected HTTP 200, received {response.status}")
+                          data = response.read(MAX_RESPONSE_BYTES + 1)
+                      break
+                  except (URLError, ConnectionError, TimeoutError, IncompleteRead) as error:
+                      reason = error.reason if isinstance(error, URLError) else error
+                      temporary = (
+                          error.code in (408, 500, 502, 503, 504) if isinstance(error, HTTPError)
+                          else isinstance(reason, (ConnectionError, TimeoutError, IncompleteRead))
+                      )
+                      if attempt or not temporary:
+                          raise
+                      print(f"Temporary download failure, retrying in 3 seconds: {url} ({error})")
+                      sleep(3)
               if len(data) > MAX_RESPONSE_BYTES:
                   raise ValueError("Upstream response exceeds the size limit")
               return data
@@ -950,6 +997,7 @@ jobs:
         run: *sync_globai
 
       - name: Preview REJECT sync
+        id: preview_reject
         if: ${{ !cancelled() }}
         shell: bash
         env:
@@ -958,6 +1006,8 @@ jobs:
       - name: Preview DIRECT sync
         if: ${{ !cancelled() }}
         shell: bash
+        env:
+          RULE_SYNC_REJECT_OUTCOME: ${{ steps.preview_reject.outcome }}
         run: *sync_rules
 
   publish:
@@ -1123,6 +1173,7 @@ jobs:
         shell: bash
         env:
           RULE_SYNC_MODE: publish
+          RULE_SYNC_REJECT_OUTCOME: ${{ needs.publish-reject.result }}
         run: *sync_rules
       - *publish_rule
       - *summarize_rule
