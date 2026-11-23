@@ -886,7 +886,8 @@ jobs:
         run: *sync_rules
 
   publish:
-    if: >-
+    name: Sync GLOBAI
+    if: &can_publish >-
       !cancelled() &&
       github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
       (github.event_name == 'schedule' ||
@@ -895,95 +896,158 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: write
+    env:
+      RULE_FILE: RULE-SET/GLOBAI.list
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - &sync_start
+        name: Record check start time
+        id: start
+        shell: bash
+        run: echo "time=$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')" >> "$GITHUB_OUTPUT"
+      - &publish_checkout
+        name: Check out current rules
+        id: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.repository.default_branch }}
-      - name: Generate validated rule set
+          fetch-depth: 0
+      - name: Fetch and validate GLOBAI
+        id: generate
         shell: bash
         env:
           GLOBAI_SYNC_MODE: publish
         run: *sync_globai
-      - name: Commit and push the rule set
+      - &publish_rule
+        name: Publish rule changes
+        id: push
+        shell: bash
         run: |
-          git add -- RULE-SET/GLOBAI.list
-          if git diff --cached --quiet -- RULE-SET/GLOBAI.list; then
+          git add -- "$RULE_FILE"
+          if git diff --cached --quiet -- "$RULE_FILE"; then
+            echo "$RULE_FILE is unchanged."
             exit 0
           fi
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git commit -m 'chore: sync GLOBAI rules'
+          name="${RULE_FILE##*/}"
+          git commit -m "chore: sync ${name%.list} rules" -- "$RULE_FILE"
           git push origin "HEAD:${GITHUB_REF}"
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - &summarize_rule
+        name: Show rule sync result
+        if: ${{ always() }}
+        continue-on-error: true
+        shell: bash
+        env:
+          STARTED: ${{ steps.start.outputs.time }}
+          BASE: ${{ steps.checkout.outputs.commit }}
+          CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
+          GENERATE_OUTCOME: ${{ steps.generate.outcome }}
+          PUSH_OUTCOME: ${{ steps.push.outcome }}
+          PUBLISHED: ${{ steps.push.outputs.commit }}
+        run: |
+          python3 - <<'PYTHON'
+          from datetime import datetime
+          from os import environ
+          from pathlib import Path
+          from subprocess import check_output
+          from zoneinfo import ZoneInfo
+
+
+          def rules(ref, path):
+              data = check_output(["git", "show", f"{ref}:{path}"], text=True)
+              return [line for raw in data.splitlines()
+                      if (line := raw.strip()) and not line.startswith(("#", "//", ";"))]
+
+
+          path = environ["RULE_FILE"]
+          base, published = environ["BASE"], environ["PUBLISHED"]
+          if published:
+              status = "✅ 已发布"
+          elif environ["CHECKOUT_OUTCOME"] != "success":
+              status = "❌ 检出失败"
+          elif environ["GENERATE_OUTCOME"] != "success":
+              status = "❌ 拉取或校验未完成"
+          elif environ["PUSH_OUTCOME"] != "success":
+              status = "❌ 发布未完成"
+          else:
+              status = "✅ 规则无变化"
+
+          total = updated = changes = "—"
+          if ref := published or base:
+              current = rules(ref, path)
+              total = f"{len(current):,}"
+              epoch = check_output(["git", "log", "-1", "--format=%ct", ref, "--", path], text=True).strip()
+              if epoch:
+                  updated = datetime.fromtimestamp(int(epoch), ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M:%S")
+              if published and base:
+                  old, new = set(rules(base, path)), set(current)
+                  changes = f"+{len(new - old):,} / -{len(old - new):,}"
+              elif status == "✅ 规则无变化":
+                  changes = "+0 / -0"
+
+          trigger = {"schedule": "定时", "workflow_dispatch": "手动"}.get(
+              environ["GITHUB_EVENT_NAME"], environ["GITHUB_EVENT_NAME"]
+          )
+          fields = [
+              ("结果", status),
+              ("触发方式", trigger),
+              ("本次检查开始 · 北京时间", environ["STARTED"] or "—"),
+              ("规则最后更新时间 · 北京时间", updated),
+              ("已发布规则总数", total),
+              ("本次发布增删", changes),
+          ]
+          with Path(environ["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as summary:
+              print(f"### {Path(path).name}\n\n| 项目 | 结果 |\n| --- | --- |", file=summary)
+              for key, value in fields:
+                  print(f"| {key} | {value} |", file=summary)
+              if published:
+                  link = f"{environ['GITHUB_SERVER_URL']}/{environ['GITHUB_REPOSITORY']}/commit/{published}"
+                  print(f"\n发布提交 [`{published[:7]}`]({link})", file=summary)
+              print(file=summary)
+          PYTHON
 
   publish-reject:
+    name: Sync REJECT
     needs: publish
-    if: >-
-      !cancelled() &&
-      github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
-      (github.event_name == 'schedule' ||
-      (github.event_name == 'workflow_dispatch' && inputs.publish))
+    if: *can_publish
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       contents: write
+    env:
+      RULE_FILE: RULE-SET/REJECT.list
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.event.repository.default_branch }}
-      - name: Generate REJECT rule set
+      - *sync_start
+      - *publish_checkout
+      - name: Fetch and validate REJECT
+        id: generate
         shell: bash
         env:
           RULE_SYNC_MODE: publish
           RULE_SYNC_TARGET: REJECT
         run: *sync_rules
-      - name: Commit and push REJECT changes
-        run: |
-          git add -- RULE-SET/REJECT.list
-          if git diff --cached --quiet; then
-            exit 0
-          fi
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git commit -m 'chore: sync REJECT rules'
-          git push origin "HEAD:${GITHUB_REF}"
+      - *publish_rule
+      - *summarize_rule
 
   publish-direct:
+    name: Sync DIRECT
     needs: publish-reject
-    if: >-
-      !cancelled() &&
-      github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
-      (github.event_name == 'schedule' ||
-      (github.event_name == 'workflow_dispatch' && inputs.publish))
+    if: *can_publish
     runs-on: ubuntu-latest
     timeout-minutes: 8
     permissions:
       contents: write
+    env:
+      RULE_FILE: RULE-SET/DIRECT.list
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.event.repository.default_branch }}
-      - name: Record DIRECT start time
-        env:
-          TRIGGER: ${{ github.event_name }}
-          SCHEDULE: ${{ github.event.schedule }}
-        run: |
-          {
-            echo "### DIRECT update"
-            echo "- Trigger: ${TRIGGER} ${SCHEDULE}"
-            echo "- Started: $(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S %Z')"
-          } >> "$GITHUB_STEP_SUMMARY"
-      - name: Generate DIRECT rule set
+      - *sync_start
+      - *publish_checkout
+      - name: Fetch and validate DIRECT
+        id: generate
         shell: bash
         env:
           RULE_SYNC_MODE: publish
         run: *sync_rules
-      - name: Commit and push DIRECT changes
-        run: |
-          git add -- RULE-SET/DIRECT.list
-          if git diff --cached --quiet; then
-            exit 0
-          fi
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git commit -m 'chore: sync DIRECT rules'
-          git push origin "HEAD:${GITHUB_REF}"
+      - *publish_rule
+      - *summarize_rule
