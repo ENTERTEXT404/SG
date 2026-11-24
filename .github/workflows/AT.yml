@@ -708,7 +708,7 @@ jobs:
             *) echo 'Unknown GLOBAI sync mode' >&2; exit 1 ;;
           esac
           python3 - "$@" <<'PYTHON'
-          """Validate MagicRule GlobalAI for Surge and optionally update the SG mirror."""
+          """Merge and validate MagicRule's AI rule sets for Surge."""
           import argparse
           from collections import Counter
           from difflib import unified_diff
@@ -718,6 +718,7 @@ jobs:
           import json
           from pathlib import Path
           import re
+          from ssl import SSLEOFError
           import sys
           from tempfile import NamedTemporaryFile
           from time import sleep
@@ -727,7 +728,6 @@ jobs:
 
           ORIGIN = "https://magicrule.pages.dev"
           INDEX_URL = f"{ORIGIN}/data/index/Surge.json"
-          RULE_ID = "24dbbb36-e5c5-4800-8fde-4af469213846"
           ROOT = Path.cwd().resolve()
           TARGET = ROOT / "RULE-SET/GLOBAI.list"
           HOST_TYPES = ("DOMAIN", "DOMAIN-SUFFIX")
@@ -737,10 +737,19 @@ jobs:
           LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
           HOSTNAME = re.compile(rf"{LABEL}(?:\.{LABEL})+")
           REVIEWED_URL_REGEX = r"https://www\.google\.com/.*continue=https://gemini\.google\.com.+"
-          EXPECTED_PROVIDERS = {
-              "https://github.com/v2fly/domain-list-community",
-              "https://raw.githubusercontent.com/VPSDance/ai-proxy-rules/refs/heads/main/rules/surge/all.list",
-              "https://ruleset.skk.moe/List/non_ip/ai.conf",
+          V2FLY = "https://github.com/v2fly/domain-list-community"
+          VPSDANCE = "https://raw.githubusercontent.com/VPSDance/ai-proxy-rules/refs/heads/main/rules/surge"
+          CLASH_AI = "https://raw.githubusercontent.com/jinxinkai/clash-ai-rules/refs/heads/master"
+          # Resolve each stable rule ID through the index so new artifact versions are picked up.
+          RULE_SOURCES = {
+              "GlobalAI": ("24dbbb36-e5c5-4800-8fde-4af469213846",
+                           {V2FLY, f"{VPSDANCE}/all.list", "https://ruleset.skk.moe/List/non_ip/ai.conf"}),
+              "OpenAI": ("d5f00db3-06dd-4dc0-9698-737971bfb428",
+                         {V2FLY, f"{VPSDANCE}/openai.list", f"{CLASH_AI}/OpenAI.yaml"}),
+              "Gemini": ("c2cc8e43-8769-4c87-89d3-60e29ea05e11", {V2FLY}),
+              "Anthropic": ("51b4a34e-0773-402d-bf70-8fdeb065ea52",
+                            {V2FLY, f"{VPSDANCE}/anthropic.list", f"{CLASH_AI}/Anthropic.yaml"}),
+              "Grok": ("ac7dbbfd-814d-4315-ad89-477b54d0f6ac", {V2FLY}),
           }
           MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 
@@ -760,11 +769,11 @@ jobs:
                               raise ValueError(f"Expected HTTP 200, received {response.status}")
                           data = response.read(MAX_RESPONSE_BYTES + 1)
                       break
-                  except (URLError, ConnectionError, TimeoutError, IncompleteRead) as error:
+                  except (URLError, ConnectionError, TimeoutError, IncompleteRead, SSLEOFError) as error:
                       reason = error.reason if isinstance(error, URLError) else error
                       temporary = (
                           error.code in (408, 500, 502, 503, 504) if isinstance(error, HTTPError)
-                          else isinstance(reason, (ConnectionError, TimeoutError, IncompleteRead))
+                          else isinstance(reason, (ConnectionError, TimeoutError, IncompleteRead, SSLEOFError))
                       )
                       if attempt or not temporary:
                           raise
@@ -779,7 +788,7 @@ jobs:
               matches = [item for item in items
                          if all(item.get(k) == v for k, v in fields.items())]
               if len(matches) != 1:
-                  raise ValueError("Could not identify exactly one GlobalAI resource")
+                  raise ValueError("Could not identify exactly one matching resource")
               return matches[0]
 
 
@@ -789,29 +798,40 @@ jobs:
               return url
 
 
-          def read_source():
-              index = json.loads(fetch(INDEX_URL))
-              if index["client"] != "Surge":
-                  raise ValueError("Expected the Surge index")
-              row = select_one(index["rules"], id=RULE_ID, name="GlobalAI")
+          def read_source(index, name, rule_id, providers):
+              row = select_one(index["rules"], id=rule_id, name=name)
               url = magicrule_url(row["manifest"], r"/data/rules/Surge/[0-9a-f]+/manifest\.json")
               manifest = json.loads(fetch(url))
-              if manifest["client"] != "Surge" or manifest["rule"] != "GlobalAI":
-                  raise ValueError("Expected the Surge GlobalAI manifest")
-              if set(row["providers"]) != EXPECTED_PROVIDERS or set(manifest["providers"]) != EXPECTED_PROVIDERS:
+              if manifest["client"] != "Surge" or manifest["rule"] != name:
+                  raise ValueError(f"Expected the Surge {name} manifest")
+              if set(row["providers"]) != providers or set(manifest["providers"]) != providers:
                   raise ValueError("Upstream provider list changed. Review provenance before updating.")
               for field in ("rule_updated_at", "type_counts", "total_line_count"):
                   if row[field] != manifest[field]:
                       raise ValueError("Index and manifest disagree. Retry after upstream finishes publishing.")
               full = select_one(manifest["artifacts"], key="rules", role="full",
                                 ext="list", empty=False, binary=False)
-              url = magicrule_url(full["url"], r"/data/_shared/artifacts/GlobalAI_rules_[0-9a-f]+\.list")
+              url = magicrule_url(full["url"], rf"/data/_shared/artifacts/{re.escape(name)}_rules_[0-9a-f]+\.list")
               data = fetch(url)
               if sha256(data).hexdigest() != full["dedupe"]["bytes_sha256"]:
-                  raise ValueError("GlobalAI download does not match its manifest SHA-256")
-              rules = parse_rules(data.decode("utf-8-sig"), "MagicRule")
+                  raise ValueError("Download does not match its manifest SHA-256")
+              rules = parse_rules(data.decode("utf-8-sig"), name)
               if len(rules) != manifest["total_line_count"] or Counter(r[0] for r in rules) != manifest["type_counts"]:
-                  raise ValueError("GlobalAI rule counts do not match its manifest")
+                  raise ValueError("Rule counts do not match the manifest")
+              print(f"{name}: {len(rules):,} validated rules from {url}")
+              return rules
+
+
+          def read_sources():
+              index = json.loads(fetch(INDEX_URL))
+              if index["client"] != "Surge":
+                  raise ValueError("Expected the Surge index")
+              rules = []
+              for name, (rule_id, providers) in RULE_SOURCES.items():
+                  try:
+                      rules.extend(read_source(index, name, rule_id, providers))
+                  except (ValueError, OSError, KeyError, TypeError, AttributeError, IncompleteRead) as error:
+                      raise ValueError(f"{name} upstream: {error}") from error
               return rules
 
 
@@ -929,7 +949,7 @@ jobs:
               old_data = TARGET.read_bytes()
               old_text = old_data.decode("utf-8-sig")
               old, _, _, _ = normalize(parse_rules(old_text, "Current GLOBAI.list"))
-              source = read_source()
+              source = read_sources()
               rules, duplicates, covered, aggregated = normalize(source)
               added = len(set(rules) - set(old))
               removed = len(set(old) - set(rules))
@@ -971,7 +991,7 @@ jobs:
                       print("GLOBAI.list contains canonical rule lines only.")
                   else:
                       sync(args.write, args.diff)
-              except (ValueError, OSError, KeyError, TypeError, AttributeError) as error:
+              except (ValueError, OSError, KeyError, TypeError, AttributeError, IncompleteRead) as error:
                   print(f"GlobalAI sync failed: {error}", file=sys.stderr)
                   return 1
               return 0
