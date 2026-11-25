@@ -35,10 +35,6 @@ env:
   DIRECT_SUKKA_IPV4_URL: https://ruleset.skk.moe/List/ip/china_ip.conf
   DIRECT_SUKKA_IPV6_URL: https://ruleset.skk.moe/List/ip/china_ip_ipv6.conf
   DIRECT_OONI_URL: https://api.ooni.io/api/v1/measurements
-  DIRECT_SUKKA_CREDIT: >-
-    中国 IPv4 和 IPv6 网段改编自 [Sukka's Ruleset](https://github.com/SukkaW/Surge)，
-    采用 [CC BY-SA 2.0](https://creativecommons.org/licenses/by-sa/2.0/)。
-    本项目筛选、去重、合并并排序了网段。
 
 concurrency:
   group: sg-rule-publish-${{ github.ref }}
@@ -574,11 +570,7 @@ jobs:
                       count_text = f"{count:,}" if count is not None else "—"
                       version = f"`{ref[:12]}`" if ref else "—"
                       print(f"| {name} | {status} | {count_text} | {version} |", file=summary)
-                  print("\n域名按各来源内去重后统计。IP 按通过解析的网段统计，尚未合并或排除。\n",
-                        file=summary)
-                  if not local_sources and (credit := getenv("DIRECT_SUKKA_CREDIT")):
-                      print(f"{credit}\n", file=summary)
-                  print("### DIRECT.list · 域名筛选结果\n", file=summary)
+                  print("\n### DIRECT.list · 域名筛选结果\n", file=summary)
                   if reject_basis:
                       print(f"拦截检查使用{reject_basis}。\n", file=summary)
                   if not filter_report:
