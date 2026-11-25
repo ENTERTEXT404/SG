@@ -3,7 +3,7 @@ run-name: ${{ github.event_name == 'schedule' && 'AT scheduled rule sync' || 'AT
 
 on:
   schedule:
-    - cron: '30 0,8,16 * * *' # 00:30, 08:30 and 16:30 in Asia/Shanghai
+    - cron: '30 0,8,16 * * *'
   pull_request:
     paths:
       - '.github/workflows/AT.yml'
@@ -13,12 +13,32 @@ on:
   workflow_dispatch:
     inputs:
       publish:
-        description: Write and push GLOBAI.list, DIRECT.list and REJECT.list
+        description: Publish GLOBAI.list → REJECT.list → DIRECT.list
         type: boolean
         default: false
 
 permissions:
   contents: read
+
+env:
+  GLOBAI_MAGICRULE_ORIGIN: https://magicrule.pages.dev
+  GLOBAI_GLOBALAI_ID: 24dbbb36-e5c5-4800-8fde-4af469213846
+  GLOBAI_OPENAI_ID: d5f00db3-06dd-4dc0-9698-737971bfb428
+  GLOBAI_GEMINI_ID: c2cc8e43-8769-4c87-89d3-60e29ea05e11
+  GLOBAI_ANTHROPIC_ID: 51b4a34e-0773-402d-bf70-8fdeb065ea52
+  GLOBAI_GROK_ID: ac7dbbfd-814d-4315-ad89-477b54d0f6ac
+
+  REJECT_AWAVENUE_URL: https://raw.githubusercontent.com/TG-Twilight/AWAvenue-Ads-Rule/main/Filters/AWAvenue-Ads-Rule-Surge-RULE-SET.list
+
+  DIRECT_LOYALSOLDIER_REF_URL: https://api.github.com/repos/Loyalsoldier/surge-rules/git/ref/heads/release
+  DIRECT_LOYALSOLDIER_RAW_URL: https://raw.githubusercontent.com/Loyalsoldier/surge-rules
+  DIRECT_SUKKA_IPV4_URL: https://ruleset.skk.moe/List/ip/china_ip.conf
+  DIRECT_SUKKA_IPV6_URL: https://ruleset.skk.moe/List/ip/china_ip_ipv6.conf
+  DIRECT_OONI_URL: https://api.ooni.io/api/v1/measurements
+  DIRECT_SUKKA_CREDIT: >-
+    中国 IPv4 和 IPv6 网段改编自 [Sukka's Ruleset](https://github.com/SukkaW/Surge)，
+    采用 [CC BY-SA 2.0](https://creativecommons.org/licenses/by-sa/2.0/)。
+    本项目筛选、去重、合并并排序了网段。
 
 concurrency:
   group: sg-rule-publish-${{ github.ref }}
@@ -30,7 +50,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - &read_only_checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
       - name: Verify DIRECT rule set
@@ -39,14 +60,12 @@ jobs:
           RULE_SYNC_MODE: check
         run: &sync_rules |
           python3 - "${RULE_SYNC_MODE:-preview}" "${RULE_SYNC_TARGET:-DIRECT}" <<'PYTHON'
-          """Generate validated Surge DIRECT and REJECT rule sets."""
-
           import argparse
           from http.client import IncompleteRead
           import ipaddress
           import json
           from datetime import date, datetime, timedelta, timezone
-          from os import getenv
+          from os import environ, getenv
           import re
           import sys
           from pathlib import Path
@@ -60,18 +79,16 @@ jobs:
           RULE_SET = Path("RULE-SET")
           DIRECT = RULE_SET / "DIRECT.list"
           REJECT = RULE_SET / "REJECT.list"
-          DOMAIN_REF = "https://api.github.com/repos/Loyalsoldier/surge-rules/git/ref/heads/release"
-          DOMAIN_ROOT = "https://raw.githubusercontent.com/Loyalsoldier/surge-rules"
-          # Per-file floors catch truncated small sources that the combined change limit could miss.
+          DOMAIN_REF = environ["DIRECT_LOYALSOLDIER_REF_URL"]
+          DOMAIN_ROOT = environ["DIRECT_LOYALSOLDIER_RAW_URL"]
           DOMAIN_MINIMUMS = {"direct": 90_000, "private": 100, "apple": 125, "icloud": 40}
           SOURCES = {
-              4: "https://ruleset.skk.moe/List/ip/china_ip.conf",
-              6: "https://ruleset.skk.moe/List/ip/china_ip_ipv6.conf",
+              4: environ["DIRECT_SUKKA_IPV4_URL"],
+              6: environ["DIRECT_SUKKA_IPV6_URL"],
           }
-          DIRECT_EXTRAS = set()  # Add reviewed (rule_type, domain) pairs here.
-          REJECT_SOURCE = ("https://raw.githubusercontent.com/TG-Twilight/AWAvenue-Ads-Rule/main/"
-                           "Filters/AWAvenue-Ads-Rule-Surge-RULE-SET.list")
-          MEASUREMENTS = "https://api.ooni.io/api/v1/measurements"
+          DIRECT_EXTRAS = set()
+          REJECT_SOURCE = environ["REJECT_AWAVENUE_URL"]
+          MEASUREMENTS = environ["DIRECT_OONI_URL"]
           MAX_LOOKUPS = 8
           HOST_TYPES = ("DOMAIN", "DOMAIN-SUFFIX")
           LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
@@ -82,51 +99,6 @@ jobs:
           MAX_BYTES = 2 * 1024 * 1024
           MAX_CHANGE_PERCENT = 10
 
-          # The CIDRs in DIRECT.list adapt Sukka's Ruleset (https://github.com/SukkaW/Surge).
-          # License: CC BY-SA 2.0 (https://creativecommons.org/licenses/by-sa/2.0/).
-          # Adaptation: comment and non-CIDR removal, deduplication, aggregation,
-          # sorting and the exclusions below.
-          # The optional --sources IPV4 IPV6 flag uses local upstream snapshots.
-          #
-          # Special-use and multicast references:
-          # https://www.iana.org/assignments/iana-ipv4-special-registry
-          # https://www.iana.org/assignments/iana-ipv6-special-registry
-          # https://www.iana.org/assignments/multicast-addresses/
-          # https://www.iana.org/assignments/ipv6-multicast-addresses/
-          #
-          # APNIC registration and RIPE RIS routes verified on 2026-11-22.
-          # The listed 14.x prefixes are Vietnam VNPT (AS45899).
-          # 202.92.4.0/22 is registered in Vietnam and originated by VNPT (AS135905).
-          # 223.122.0.0/16, 223.123.128.0/18, 223.123.192.0/20:
-          # China Mobile Hong Kong (AS9231, AS137872).
-          # 223.123.0.0/17: Pakistan CMPak (AS59257, AS138423).
-          # https://ftp.apnic.net/stats/apnic/delegated-apnic-latest
-          # https://rdap.apnic.net/ip/14.226.104.0
-          # https://stat.ripe.net/resource/AS45899
-          # https://rdap.apnic.net/ip/202.92.4.0
-          # https://stat.ripe.net/resource/202.92.4.0/22
-          # https://stat.ripe.net/resource/223.122.0.0/15
-          # Keep CMNET's 223.123.208.0/20 and 223.123.224.0/19.
-          #
-          # Additional IPv4 exclusions cross-checked against APNIC RDAP and RIPE RIS:
-          # 117.134.192.0/18: CMPak (AS59257, AS138423), inside CMNET's 117.128.0.0/10.
-          # 103.143.92.0/23 and 202.75.248.0/22: China Telecom Macau (AS136167).
-          # 218.213.85.0/24 and 222.167.160.0/23: HKNet and HK Cable (AS9293, AS9908).
-          # 160.187.128.0/23: Lao Communication Technology (AS153347).
-          # 103.220.156.0/22: Microtel and Cityline India (AS135251, AS135746).
-          # 1.18.128.0/24: Korea Internet Security Agency (AS23596).
-          # Use https://rdap.apnic.net/ip/<network-address> for registration and
-          # https://stat.ripe.net/resource/<prefix> for route evidence.
-          # IPv6 site assignments verified on 2026-11-22:
-          # APNIC records identify 8021 and 9020 as Singapore; 8040 as Japan;
-          # 9050 as South Korea; 9060 as Indonesia; 9071 as Malaysia; 9080 as Thailand.
-          # Registration can be checked at https://rdap.apnic.net/ip/2400:9380:8021::
-          # 2c0f:f7a8:9041::/48: AFRINIC's China Telecom South Africa allocation
-          # and the exact RADB route6 for AS23764 describe it as CTGNET Africa space.
-          # https://rdap.afrinic.net/rdap/ip/2c0f:f7a8:9041::
-          # https://www.radb.net/query?keywords=2c0f%3Af7a8%3A9041%3A%3A%2F48
-          # Retain 2400:9380:8001::/48 pending site evidence. Its APNIC address
-          # is the operator's Hong Kong office; public Atlas traces did not reach it.
           EXCLUSIONS = {
               4: (
                   "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
@@ -208,7 +180,6 @@ jobs:
                           value = fields[0]
                       elif (fields[0] == RULE_TYPES[version] and
                             (len(fields) == 2 or fields[2:] == ["no-resolve"])):
-                          # Match the published list's existing DNS behavior.
                           value = fields[1]
                       else:
                           raise ValueError("unexpected rule type, policy or option")
@@ -519,13 +490,10 @@ jobs:
               incoming = set().union(*sources.values(), DIRECT_EXTRAS)
               new_candidates = len(incoming - old)
               parents = suffixes(incoming)
-              # Check old and new rules before compacting. A narrower REJECT rule
-              # cannot remove an entire DIRECT suffix or its other subdomains.
               allowed, conflicts = remove_reject_conflicts(old | incoming, reject)
               for kind, name in sorted(conflicts):
                   print(f"Skip {kind},{name}: covered by REJECT")
               incoming &= allowed
-              # Keep existing narrow coverage while a new upstream suffix is pending.
               retained = {rule for rule in old & allowed if rule in incoming or in_suffix(rule, parents)}
               old, retained = compact_hosts(old), compact_hosts(retained)
               tracked_changes("DIRECT existing domains", old, retained)
@@ -551,7 +519,6 @@ jobs:
               rate_limited = False
               today = datetime.now(timezone.utc).date()
               if pending:
-                  # Bound remote lookups and rotate the queue so large releases are revisited.
                   offset = today.toordinal() % len(pending)
                   order = pending[offset:] + pending[:offset]
                   batch = order[:MAX_LOOKUPS]
@@ -609,6 +576,8 @@ jobs:
                       print(f"| {name} | {status} | {count_text} | {version} |", file=summary)
                   print("\n域名按各来源内去重后统计。IP 按通过解析的网段统计，尚未合并或排除。\n",
                         file=summary)
+                  if not local_sources and (credit := getenv("DIRECT_SUKKA_CREDIT")):
+                      print(f"{credit}\n", file=summary)
                   print("### DIRECT.list · 域名筛选结果\n", file=summary)
                   if reject_basis:
                       print(f"拦截检查使用{reject_basis}。\n", file=summary)
@@ -622,7 +591,7 @@ jobs:
 
 
           def main():
-              parser = argparse.ArgumentParser(description=__doc__)
+              parser = argparse.ArgumentParser(description="Generate validated Surge DIRECT and REJECT rule sets.")
               parser.add_argument("mode", choices=("check", "preview", "publish"))
               parser.add_argument("target", choices=("DIRECT", "REJECT"))
               parser.add_argument(
@@ -708,7 +677,6 @@ jobs:
             *) echo 'Unknown GLOBAI sync mode' >&2; exit 1 ;;
           esac
           python3 - "$@" <<'PYTHON'
-          """Merge and validate MagicRule's AI rule sets for Surge."""
           import argparse
           from collections import Counter
           from difflib import unified_diff
@@ -716,6 +684,7 @@ jobs:
           from http.client import IncompleteRead
           import ipaddress
           import json
+          from os import environ
           from pathlib import Path
           import re
           from ssl import SSLEOFError
@@ -726,7 +695,7 @@ jobs:
           from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 
-          ORIGIN = "https://magicrule.pages.dev"
+          ORIGIN = environ["GLOBAI_MAGICRULE_ORIGIN"]
           INDEX_URL = f"{ORIGIN}/data/index/Surge.json"
           ROOT = Path.cwd().resolve()
           TARGET = ROOT / "RULE-SET/GLOBAI.list"
@@ -740,16 +709,15 @@ jobs:
           V2FLY = "https://github.com/v2fly/domain-list-community"
           VPSDANCE = "https://raw.githubusercontent.com/VPSDance/ai-proxy-rules/refs/heads/main/rules/surge"
           CLASH_AI = "https://raw.githubusercontent.com/jinxinkai/clash-ai-rules/refs/heads/master"
-          # Resolve each stable rule ID through the index so new artifact versions are picked up.
           RULE_SOURCES = {
-              "GlobalAI": ("24dbbb36-e5c5-4800-8fde-4af469213846",
+              "GlobalAI": (environ["GLOBAI_GLOBALAI_ID"],
                            {V2FLY, f"{VPSDANCE}/all.list", "https://ruleset.skk.moe/List/non_ip/ai.conf"}),
-              "OpenAI": ("d5f00db3-06dd-4dc0-9698-737971bfb428",
+              "OpenAI": (environ["GLOBAI_OPENAI_ID"],
                          {V2FLY, f"{VPSDANCE}/openai.list", f"{CLASH_AI}/OpenAI.yaml"}),
-              "Gemini": ("c2cc8e43-8769-4c87-89d3-60e29ea05e11", {V2FLY}),
-              "Anthropic": ("51b4a34e-0773-402d-bf70-8fdeb065ea52",
+              "Gemini": (environ["GLOBAI_GEMINI_ID"], {V2FLY}),
+              "Anthropic": (environ["GLOBAI_ANTHROPIC_ID"],
                             {V2FLY, f"{VPSDANCE}/anthropic.list", f"{CLASH_AI}/Anthropic.yaml"}),
-              "Grok": ("ac7dbbfd-814d-4315-ad89-477b54d0f6ac", {V2FLY}),
+              "Grok": (environ["GLOBAI_GROK_ID"], {V2FLY}),
           }
           MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 
@@ -922,7 +890,6 @@ jobs:
                       networks[kind].append(ipaddress.ip_network(value))
                   else:
                       output.append(rule)
-              # All accepted CIDRs carry no-resolve. Collapse only within each family.
               for kind, ranges in networks.items():
                   output.extend((kind, str(net), "no-resolve") for net in ipaddress.collapse_addresses(ranges))
               return (sorted(output, key=sort_key), len(rules) - len(unique),
@@ -976,7 +943,7 @@ jobs:
 
 
           def main():
-              parser = argparse.ArgumentParser(description=__doc__)
+              parser = argparse.ArgumentParser(description="Merge and validate MagicRule's AI rule sets for Surge.")
               mode = parser.add_mutually_exclusive_group()
               mode.add_argument("--write", action="store_true", help="write RULE-SET/GLOBAI.list")
               mode.add_argument("--check", action="store_true", help="validate the committed GLOBAI.list")
@@ -1009,9 +976,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 8
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
+      - *read_only_checkout
       - name: Preview GLOBAI sync
         shell: bash
         run: *sync_globai
@@ -1052,7 +1017,7 @@ jobs:
       - &publish_checkout
         name: Check out current rules
         id: checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
