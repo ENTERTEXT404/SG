@@ -1,0 +1,1132 @@
+name: AT
+run-name: ${{ github.event_name == 'schedule' && 'AT scheduled rule sync' || 'AT' }}
+
+on:
+  schedule:
+    - cron: '30 0,8,16 * * *'
+  pull_request:
+    paths:
+      - '.github/workflows/AT.yml'
+      - 'RULE-SET/DIRECT.list'
+      - 'RULE-SET/GLOBAI.list'
+      - 'RULE-SET/REJECT.list'
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish GLOBAI.list → REJECT.list → DIRECT.list
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  GLOBAI_MAGICRULE_ORIGIN: https://magicrule.pages.dev
+  GLOBAI_OPENAI_ID: d5f00db3-06dd-4dc0-9698-737971bfb428
+  GLOBAI_GEMINI_ID: c2cc8e43-8769-4c87-89d3-60e29ea05e11
+  GLOBAI_ANTHROPIC_ID: 51b4a34e-0773-402d-bf70-8fdeb065ea52
+  GLOBAI_GROK_ID: ac7dbbfd-814d-4315-ad89-477b54d0f6ac
+
+  REJECT_AWAVENUE_URL: https://raw.githubusercontent.com/TG-Twilight/AWAvenue-Ads-Rule/main/Filters/AWAvenue-Ads-Rule-Surge-RULE-SET.list
+
+  DIRECT_LOYALSOLDIER_REF_URL: https://api.github.com/repos/Loyalsoldier/surge-rules/git/ref/heads/release
+  DIRECT_LOYALSOLDIER_RAW_URL: https://raw.githubusercontent.com/Loyalsoldier/surge-rules
+  DIRECT_SUKKA_IPV4_URL: https://ruleset.skk.moe/List/ip/china_ip.conf
+  DIRECT_SUKKA_IPV6_URL: https://ruleset.skk.moe/List/ip/china_ip_ipv6.conf
+  DIRECT_OONI_URL: https://api.ooni.io/api/v1/measurements
+
+concurrency:
+  group: sg-rule-publish-${{ github.ref }}
+  queue: max
+
+jobs:
+  check-rules:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - &read_only_checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Verify DIRECT rule set
+        shell: bash
+        env:
+          RULE_SYNC_MODE: check
+        run: &sync_rules |
+          python3 - "${RULE_SYNC_MODE:-preview}" "${RULE_SYNC_TARGET:-DIRECT}" <<'PYTHON'
+          import argparse
+          from http.client import IncompleteRead
+          import ipaddress
+          import json
+          from datetime import date, datetime, timedelta, timezone
+          from os import environ, getenv
+          import re
+          import sys
+          from pathlib import Path
+          from tempfile import NamedTemporaryFile
+          from time import sleep
+          from urllib.error import HTTPError, URLError
+          from urllib.parse import urlencode, urlsplit
+          from urllib.request import Request, urlopen
+
+
+          RULE_SET = Path("RULE-SET")
+          DIRECT = RULE_SET / "DIRECT.list"
+          REJECT = RULE_SET / "REJECT.list"
+          DOMAIN_REF = environ["DIRECT_LOYALSOLDIER_REF_URL"]
+          DOMAIN_ROOT = environ["DIRECT_LOYALSOLDIER_RAW_URL"]
+          DOMAIN_MINIMUMS = {"direct": 90_000, "private": 100, "apple": 125, "icloud": 40}
+          SOURCES = {
+              4: environ["DIRECT_SUKKA_IPV4_URL"],
+              6: environ["DIRECT_SUKKA_IPV6_URL"],
+          }
+          DIRECT_EXTRAS = set()
+          REJECT_SOURCE = environ["REJECT_AWAVENUE_URL"]
+          MEASUREMENTS = environ["DIRECT_OONI_URL"]
+          MAX_LOOKUPS = 8
+          HOST_TYPES = ("DOMAIN", "DOMAIN-SUFFIX")
+          LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+          HOSTNAME = re.compile(rf"{LABEL}(?:\.{LABEL})*")
+          KEYWORD = re.compile(r"[A-Za-z0-9._-]+")
+          RULE_TYPES = {4: "IP-CIDR", 6: "IP-CIDR6"}
+          IP_VERSIONS = {kind: version for version, kind in RULE_TYPES.items()}
+          MAX_BYTES = 2 * 1024 * 1024
+
+          EXCLUSIONS = {
+              4: (
+                  "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
+                  "169.254.0.0/16", "172.16.0.0/12", "192.0.2.0/24", "192.168.0.0/16",
+                  "198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24", "224.0.0.0/4",
+                  "240.0.0.0/4",
+                  "14.226.104.0/21", "14.226.168.0/21", "14.227.96.0/20",
+                  "14.227.192.0/20", "14.241.232.0/21", "14.255.16.0/24",
+                  "14.255.238.0/24", "14.255.254.0/24", "202.92.4.0/22",
+                  "223.122.0.0/16", "223.123.0.0/17",
+                  "223.123.128.0/18", "223.123.192.0/20",
+                  "117.134.192.0/18", "103.143.92.0/23", "202.75.248.0/22",
+                  "218.213.85.0/24", "222.167.160.0/23", "160.187.128.0/23",
+                  "103.220.156.0/22", "1.18.128.0/24",
+              ),
+              6: (
+                  "::/128", "::1/128", "::ffff:0:0/96", "100::/64", "2001:2::/48",
+                  "2001:db8::/32", "3fff::/20", "fc00::/7", "fe80::/10", "ff00::/8",
+                  "2400:9380:8021::/48", "2400:9380:8040::/48", "2400:9380:9020::/47",
+                  "2400:9380:9050::/47", "2400:9380:9060::/48", "2400:9380:9071::/48",
+                  "2400:9380:9080::/47", "2c0f:f7a8:9041::/48",
+              ),
+          }
+          SIZE_HEADER = re.compile(r"^#\s*Size:\s*([0-9]+)\s*$")
+          COMMENT = re.compile(r"#|//|;")
+          UPSTREAM_MARKER = ["DOMAIN", "7h15.ru1353t.1s.m4d3.by.5ukk4w.skk.moe"]
+
+
+          def fetch(url, limit=MAX_BYTES, timeout=30, *, retry=True):
+              request = Request(url, headers={"User-Agent": "SG-Rule-Sync/1"})
+              for attempt in range(2):
+                  try:
+                      with urlopen(request, timeout=timeout) as response:
+                          data = response.read(limit + 1)
+                      break
+                  except (URLError, ConnectionError, TimeoutError, IncompleteRead) as error:
+                      reason = error.reason if isinstance(error, URLError) else error
+                      temporary = (
+                          error.code in (408, 500, 502, 503, 504) if isinstance(error, HTTPError)
+                          else isinstance(reason, (ConnectionError, TimeoutError, IncompleteRead))
+                      )
+                      if not retry or attempt or not temporary:
+                          raise
+                      print(f"Temporary download failure, retrying in 3 seconds: {url} ({error})")
+                      sleep(3)
+              if len(data) > limit:
+                  raise ValueError(f"response exceeds the size limit: {url}")
+              return data
+
+
+          def parse_network(value, version):
+              if "%" in value or not re.search(r"/[0-9]+$", value):
+                  raise ValueError("expected a CIDR with a numeric prefix length")
+              network = ipaddress.ip_network(value)
+              if network.version != version or not network.prefixlen:
+                  raise ValueError(f"expected an IPv{version} network narrower than /0")
+              return network
+
+
+          def parse_rules(data, version, require_size):
+              if len(data) > MAX_BYTES:
+                  raise ValueError("source exceeds the size limit")
+
+              sizes = []
+              valid = []
+              total = 0
+              for number, raw in enumerate(data.decode("utf-8-sig").splitlines(), 1):
+                  if match := SIZE_HEADER.fullmatch(raw.strip()):
+                      sizes.append(int(match[1]))
+                  line = COMMENT.split(raw, maxsplit=1)[0].strip()
+                  if not line:
+                      continue
+                  total += 1
+                  fields = [field.strip() for field in line.split(",")]
+                  if fields == UPSTREAM_MARKER:
+                      continue
+                  try:
+                      if len(fields) == 1:
+                          value = fields[0]
+                      elif (fields[0] == RULE_TYPES[version] and
+                            (len(fields) == 2 or fields[2:] == ["no-resolve"])):
+                          value = fields[1]
+                      else:
+                          raise ValueError("unexpected rule type, policy or option")
+                      valid.append(parse_network(value, version))
+                  except ValueError as error:
+                      raise ValueError(f"line {number}: {error}") from error
+
+              if (require_size or sizes) and sizes != [total]:
+                  raise ValueError(f"source size header disagrees with the {total} rule lines")
+              if not valid:
+                  raise ValueError("source has no valid CIDRs for this address family")
+              return valid, total - len(valid)
+
+
+          def subtract(network, excluded):
+              if not network.overlaps(excluded):
+                  return (network,)
+              if network.subnet_of(excluded):
+                  return ()
+              return network.address_exclude(excluded)
+
+
+          def build_rules(data, version, require_size):
+              valid, ignored = parse_rules(data, version, require_size)
+              unique = set(valid)
+              upstream = list(ipaddress.collapse_addresses(unique))
+              networks = upstream
+              for cidr in EXCLUSIONS[version]:
+                  excluded = ipaddress.ip_network(cidr)
+                  networks = [part for network in networks for part in subtract(network, excluded)]
+              if not networks:
+                  raise ValueError("no CIDRs remain after exclusions")
+
+              result = sorted(ipaddress.collapse_addresses(networks))
+              excluded_addresses = sum(net.num_addresses for net in upstream) - sum(
+                  net.num_addresses for net in result
+              )
+              print(
+                  f"IPv{version}: {len(valid)} valid, {ignored} ignored, "
+                  f"{len(valid) - len(unique)} duplicates, {len(unique) - len(upstream)} "
+                  f"redundant or merged, {excluded_addresses} excluded addresses, "
+                  f"{len(result)} published CIDRs"
+              )
+              return result, len(valid)
+
+
+          def read_direct(data):
+              domains = set()
+              networks = {version: [] for version in RULE_TYPES}
+              in_cidrs = False
+              for number, line in checked_lines(data):
+                  kind, comma, value = line.partition(",")
+                  if kind in IP_VERSIONS:
+                      in_cidrs = True
+                      version = IP_VERSIONS[kind]
+                      networks[version].append(parse_network(value, version))
+                  elif in_cidrs or not comma:
+                      raise ValueError(f"DIRECT line {number}: expected domain rules before CIDRs")
+                  else:
+                      domains.add(parse_host(kind, value))
+              if not domains or any(not ranges or ranges != sorted(ipaddress.collapse_addresses(ranges))
+                                    for ranges in networks.values()):
+                  raise ValueError("DIRECT must contain domains and both CIDR families, sorted and aggregated")
+              return domains, networks
+
+
+          def report_network_changes(old, new, version):
+              old_count = len(old)
+              new_count = len(new)
+              old_size = sum(n.num_addresses for n in ipaddress.collapse_addresses(old))
+              new_size = sum(n.num_addresses for n in new)
+              union_size = sum(n.num_addresses for n in ipaddress.collapse_addresses(old + new))
+              added = union_size - old_size
+              removed = union_size - new_size
+              print(f"IPv{version} vs published: {old_count} -> {new_count} CIDRs, "
+                    f"+{added:,} / -{removed:,} addresses")
+
+
+          def write_if_changed(target, data):
+              if target.exists() and target.read_bytes() == data:
+                  print(f"{target.name} is up to date.")
+                  return
+
+              mode = target.stat().st_mode & 0o777 if target.exists() else 0o644
+              with NamedTemporaryFile(dir=target.parent, delete=False) as temporary:
+                  path = Path(temporary.name)
+                  try:
+                      temporary.write(data)
+                      temporary.close()
+                      path.chmod(mode)
+                      path.replace(target)
+                  finally:
+                      path.unlink(missing_ok=True)
+              print(f"Updated {target.name}.")
+
+
+          def sync_networks(baseline, sources, source_report):
+              result = {}
+              for index, (version, url) in enumerate(SOURCES.items()):
+                  source = sources[index] if sources else url
+                  try:
+                      source_report[version] = ("读取失败" if sources else "拉取失败", None, None)
+                      data = source.read_bytes() if sources else fetch(source)
+                      source_report[version] = ("已读取 · 内容校验失败", None, None)
+                      networks, count = build_rules(data, version, require_size=not sources)
+                      report_network_changes(baseline[version], networks, version)
+                      source_report[version] = ("校验通过", count, None)
+                      result[version] = networks
+                  except (OSError, ValueError) as error:
+                      raise ValueError(f"IPv{version} {source}: {error}") from error
+              return result
+
+
+          def render_cidrcn(networks):
+              return "".join(
+                  f"{RULE_TYPES[version]},{network}\n"
+                  for version, ranges in networks.items()
+                  for network in ranges
+              ).encode("utf-8")
+
+
+          def suffixes(rules):
+              return {value for kind, value in rules if kind == "DOMAIN-SUFFIX"}
+
+
+          def in_suffix(rule, parents, proper=False):
+              kind, value = rule
+              labels = value.split(".")
+              first = int(kind == "DOMAIN-SUFFIX" and proper)
+              return any(".".join(labels[i:]) in parents for i in range(first, len(labels)))
+
+
+          def compact_hosts(rules):
+              parents = suffixes(rules)
+              return {rule for rule in rules if not in_suffix(rule, parents, proper=True)}
+
+
+          def render_hosts(rules):
+              ordered = sorted(rules, key=lambda rule: (rule[0], tuple(reversed(rule[1].split(".")))))
+              return "".join(f"{kind},{value}\n" for kind, value in ordered).encode("utf-8")
+
+
+          def parse_host(kind, value):
+              name = value.lower()
+              if kind not in HOST_TYPES or not value.isascii() or len(name) > 253 or not HOSTNAME.fullmatch(name):
+                  raise ValueError("invalid domain rule")
+              return kind, name
+
+
+          def checked_lines(data):
+              return ((number, raw.strip()) for number, raw in enumerate(data.decode("utf-8-sig").splitlines(), 1)
+                      if raw.strip() and not raw.lstrip().startswith(("#", "//", ";")))
+
+
+          def tracked_changes(label, old, new):
+              added, removed = new - old, old - new
+              print(f"{label}: {len(old):,} -> {len(new):,} (+{len(added):,}, -{len(removed):,})")
+              for sign, changed in (("+", added), ("-", removed)):
+                  for kind, value in sorted(changed)[:20]:
+                      print(f"  {sign} {kind},{value}")
+
+
+          def fetch_domains(source_report):
+              for source in DOMAIN_MINIMUMS:
+                  source_report[source] = ("上游版本读取失败", None, None)
+              ref = json.loads(fetch(DOMAIN_REF, 64 * 1024))["object"]["sha"]
+              if not re.fullmatch(r"[0-9a-f]{40}", ref):
+                  raise ValueError("invalid Loyalsoldier release commit")
+              for source in DOMAIN_MINIMUMS:
+                  source_report[source] = ("未执行", None, ref)
+              source_rules = {}
+              for source, minimum in DOMAIN_MINIMUMS.items():
+                  source_report[source] = ("拉取失败", None, ref)
+                  data = fetch(f"{DOMAIN_ROOT}/{ref}/ruleset/{source}.txt", 6 * 1024 * 1024)
+                  source_report[source] = ("已读取 · 内容校验失败", None, ref)
+                  try:
+                      rules = {parse_host(*line.split(",", 1)) for _, line in checked_lines(data)}
+                  except (TypeError, ValueError) as error:
+                      raise ValueError(f"{source}.txt: expected DOMAIN or DOMAIN-SUFFIX") from error
+                  if len(rules) < minimum:
+                      source_report[source] = ("已读取 · 数量低于下限", len(rules), ref)
+                      raise ValueError(f"{source}.txt has only {len(rules)} rules. Expected at least {minimum}")
+                  source_report[source] = ("校验通过", len(rules), ref)
+                  source_rules[source] = rules
+                  print(f"{source}.txt @ {ref[:12]}: {len(rules):,} unique domain rules")
+              return source_rules
+
+
+          def parse_reject(data, upstream=False):
+              hosts, keywords = set(), set()
+              networks = {version: [] for version in RULE_TYPES}
+              count = 0
+              for number, line in checked_lines(data):
+                  count += 1
+                  fields = line.split(",")
+                  kind = fields[0]
+                  try:
+                      if kind in HOST_TYPES and len(fields) == 2:
+                          hosts.add(parse_host(*fields))
+                      elif kind == "DOMAIN-KEYWORD" and len(fields) == 2 and KEYWORD.fullmatch(fields[1]):
+                          keywords.add(fields[1].lower())
+                      elif kind in IP_VERSIONS and (len(fields) == 2 or fields[2:] == ["no-resolve"]):
+                          version = IP_VERSIONS[kind]
+                          networks[version].append(parse_network(fields[1], version))
+                      else:
+                          raise ValueError("unsupported rule type, policy or option")
+                  except ValueError as error:
+                      raise ValueError(f"REJECT line {number}: {error}") from error
+              if upstream:
+                  sizes = re.findall(rb"(?m)^#Total lines:[ \t]*([0-9]+)[ \t]*\r?$", data)
+                  if len(sizes) != 1 or int(sizes[0]) != count:
+                      raise ValueError("AWAvenue rule count does not match the source header")
+              if not hosts:
+                  raise ValueError("REJECT has no domain rules")
+              return hosts, keywords, networks
+
+
+          def normalize_reject(rules):
+              hosts, keywords, networks = rules
+              return compact_hosts(hosts), keywords, {
+                  version: sorted(ipaddress.collapse_addresses(ranges)) for version, ranges in networks.items()
+              }
+
+
+          def render_reject(rules):
+              hosts, keywords, networks = rules
+              ip_rules = "".join(f"{RULE_TYPES[version]},{net},no-resolve\n"
+                                 for version, ranges in networks.items() for net in ranges)
+              keyword_rules = "".join(f"DOMAIN-KEYWORD,{word}\n" for word in sorted(keywords))
+              return ip_rules.encode("utf-8") + render_hosts(hosts) + keyword_rules.encode("utf-8")
+
+
+          def sync_reject(current):
+              old_hosts, old_keywords, old_networks = normalize_reject(parse_reject(current))
+              new = normalize_reject(parse_reject(fetch(REJECT_SOURCE), upstream=True))
+              hosts, keywords, networks = new
+              tracked_changes("REJECT domains", old_hosts, hosts)
+              tracked_changes("REJECT keywords", {("DOMAIN-KEYWORD", word) for word in old_keywords},
+                              {("DOMAIN-KEYWORD", word) for word in keywords})
+              for version, kind in RULE_TYPES.items():
+                  tracked_changes(f"REJECT IPv{version}", {(kind, str(net)) for net in old_networks[version]},
+                                  {(kind, str(net)) for net in networks[version]})
+              return render_reject(new)
+
+
+          def measurement_support(rows, host, since):
+              healthy = set()
+              for row in rows:
+                  if (row["probe_cc"] != "CN" or row["test_name"] != "web_connectivity"
+                          or row.get("verification_status") != "verified" or row.get("failure") is not False):
+                      continue
+                  url = urlsplit(row["input"])
+                  day = date.fromisoformat(row["measurement_start_time"][:10])
+                  asn = row["probe_asn"]
+                  if (url.scheme != "https" or url.hostname != host or day < since
+                          or not re.fullmatch(r"AS[1-9][0-9]*", asn)):
+                      continue
+                  if row.get("anomaly") is True or row.get("confirmed") is True:
+                      return False
+                  if row.get("anomaly") is False and row.get("confirmed") is False:
+                      healthy.add((asn, day))
+              return len({asn for asn, _ in healthy}) >= 2 and len({day for _, day in healthy}) >= 2
+
+
+          def mainland_evidence(host, since):
+              params = urlencode(dict(probe_cc="CN", test_name="web_connectivity", domain=host,
+                                    since=since.isoformat(), limit=30))
+              try:
+                  response = json.loads(fetch(f"{MEASUREMENTS}?{params}", timeout=20, retry=False))
+                  return "supported" if measurement_support(response["results"], host, since) else "insufficient"
+              except HTTPError as error:
+                  print(f"OONI {host}: measurement lookup unavailable ({error})")
+                  return "rate_limited" if error.code == 429 else "unavailable"
+              except (OSError, ValueError, TypeError, AttributeError, KeyError) as error:
+                  print(f"OONI {host}: measurement lookup unavailable ({error})")
+                  return "unavailable"
+
+
+          def fully_rejected(rule, reject_hosts, reject_parents, reject_keywords):
+              return (rule in reject_hosts or in_suffix(rule, reject_parents)
+                      or any(word in rule[1] for word in reject_keywords))
+
+
+          def remove_reject_conflicts(rules, reject):
+              reject_hosts, reject_keywords, _ = parse_reject(reject)
+              reject_parents = suffixes(reject_hosts)
+              excluded = {rule for rule in rules
+                          if fully_rejected(rule, reject_hosts, reject_parents, reject_keywords)}
+              return rules - excluded, excluded
+
+
+          def sync_domains(old, reject, source_report, filter_report):
+              sources = fetch_domains(source_report)
+              incoming = set().union(*sources.values(), DIRECT_EXTRAS)
+              new_candidates = len(incoming - old)
+              parents = suffixes(incoming)
+              allowed, conflicts = remove_reject_conflicts(old | incoming, reject)
+              for kind, name in sorted(conflicts):
+                  print(f"Skip {kind},{name}: covered by REJECT")
+              incoming &= allowed
+              retained = {rule for rule in old & allowed if rule in incoming or in_suffix(rule, parents)}
+              old, retained = compact_hosts(old), compact_hosts(retained)
+              tracked_changes("DIRECT existing domains", old, retained)
+              retained_parents = suffixes(retained)
+              approved, pending = set(), []
+              covered = skipped = preapproved = 0
+              for rule in sorted(incoming - retained):
+                  kind, name = rule
+                  if in_suffix(rule, retained_parents):
+                      covered += 1
+                      continue
+                  if rule in sources["private"] or rule in DIRECT_EXTRAS:
+                      preapproved += 1
+                      approved.add(rule)
+                      print(f"Accept {kind},{name}: private or explicitly maintained")
+                  elif kind == "DOMAIN" and "." in name:
+                      pending.append(rule)
+                  else:
+                      skipped += 1
+                      print(f"Skip {kind},{name}: no evidence for the entire suffix")
+              outcomes = dict.fromkeys(("supported", "insufficient", "unavailable"), 0)
+              deferred = len(pending)
+              rate_limited = False
+              today = datetime.now(timezone.utc).date()
+              if pending:
+                  offset = today.toordinal() % len(pending)
+                  order = pending[offset:] + pending[:offset]
+                  batch = order[:MAX_LOOKUPS]
+                  since = today - timedelta(days=30)
+                  for index, rule in enumerate(batch):
+                      if index:
+                          sleep(1)
+                      outcome = mainland_evidence(rule[1], since)
+                      if outcome == "rate_limited":
+                          rate_limited = True
+                          print(f"Deferred {len(batch) - index} domains after OONI rate limiting")
+                          break
+                      deferred -= 1
+                      outcomes[outcome] += 1
+                      if outcome == "supported":
+                          approved.add(rule)
+                          detail = "mainland measurement criteria met"
+                      elif outcome == "unavailable":
+                          detail = "mainland measurement lookup unavailable"
+                      else:
+                          detail = "insufficient mainland measurements"
+                      print(f"{'Accept' if outcome == 'supported' else 'Skip'} {','.join(rule)}: {detail}")
+                  if len(order) > MAX_LOOKUPS:
+                      print(f"Deferred {len(order) - MAX_LOOKUPS} new domains to a later lookup window")
+              result = compact_hosts(retained | approved)
+              tracked_changes("DIRECT published domains", old, result)
+              filter_report.update({
+                  "未出现在现有名单的域名规则（去重后）": new_candidates,
+                  "被 REJECT 覆盖（含现有规则）": len(conflicts),
+                  "已被保留的直连后缀覆盖": covered,
+                  "私有域名或手工规则直接通过": preapproved,
+                  "通过大陆连通性检查": outcomes["supported"],
+                  "大陆连通性证据不足": outcomes["insufficient"],
+                  "测量服务查询失败": outcomes["unavailable"],
+                  "缺少整段后缀的连通性证据": skipped,
+                  "待后续检查" + ("（本次遇到测量服务限流）" if rate_limited else ""): deferred,
+                  "筛选后拟新增的域名规则": len(result - old),
+              })
+              return result
+
+
+          def show_direct_report(path, source_report, filter_report, local_sources, reject_basis):
+              with Path(path).open("a", encoding="utf-8") as summary:
+                  print("### DIRECT.list · 上游状态\n", file=summary)
+                  print("| 上游 | 结果 | 读取规则数 | 上游版本 |", file=summary)
+                  print("| --- | --- | ---: | --- |", file=summary)
+                  for source, (status, count, ref) in source_report.items():
+                      if source in SOURCES:
+                          provider = "本地快照" if local_sources else "Sukka"
+                          name = f"{provider} · IPv{source}"
+                      else:
+                          name = f"Loyalsoldier · {source}.txt"
+                      count_text = f"{count:,}" if count is not None else "—"
+                      version = f"`{ref[:12]}`" if ref else "—"
+                      print(f"| {name} | {status} | {count_text} | {version} |", file=summary)
+                  print("\n### DIRECT.list · 域名筛选结果\n", file=summary)
+                  if reject_basis:
+                      print(f"拦截检查使用{reject_basis}。\n", file=summary)
+                  if not filter_report:
+                      print("本次未完成域名筛选，请查看上游状态和任务日志。\n", file=summary)
+                      return
+                  print("| 项目 | 条数 |\n| --- | ---: |", file=summary)
+                  for label, count in filter_report.items():
+                      print(f"| {label} | {count:,} |", file=summary)
+                  print("\n这里统计候选规则。实际发布结果见同步摘要。\n", file=summary)
+
+
+          def main():
+              parser = argparse.ArgumentParser(description="Generate validated Surge DIRECT and REJECT rule sets.")
+              parser.add_argument("mode", choices=("check", "preview", "publish"))
+              parser.add_argument("target", choices=("DIRECT", "REJECT"))
+              parser.add_argument(
+                  "--sources", nargs=2, type=Path, metavar=("IPV4", "IPV6"),
+                  help="use local CIDR source snapshots in place of downloads",
+              )
+              args = parser.parse_args()
+              if args.sources and (args.mode == "check" or args.target != "DIRECT"):
+                  parser.error("--sources is only for DIRECT preview or publish")
+              target = DIRECT if args.target == "DIRECT" else REJECT
+              summary = getenv("GITHUB_STEP_SUMMARY") if target == DIRECT and args.mode != "check" else None
+              source_report = dict.fromkeys((*DOMAIN_MINIMUMS, *SOURCES), ("未执行", None, None))
+              filter_report = {}
+              runner_temp = getenv("RUNNER_TEMP")
+              preview_reject = (Path(runner_temp) / "sg-preview-reject.list"
+                                if args.mode == "preview" and runner_temp else None)
+              reject_outcome = getenv("RULE_SYNC_REJECT_OUTCOME")
+              reject_basis = None
+
+              try:
+                  current = target.read_bytes()
+                  if target == DIRECT:
+                      domains, baseline = read_direct(current)
+                      if args.mode != "check":
+                          reject_path = REJECT
+                          reject_basis = "仓库中的 REJECT.list"
+                          if preview_reject is not None and reject_outcome == "success":
+                              reject_path = preview_reject
+                              reject_basis = "本轮预览生成的 REJECT.list"
+                          elif reject_outcome and reject_outcome != "success":
+                              reject_basis += "（本轮 REJECT 同步未成功）"
+                          domains = sync_domains(domains, reject_path.read_bytes(), source_report, filter_report)
+                          baseline = sync_networks(baseline, args.sources, source_report)
+                      candidate = render_hosts(compact_hosts(domains)) + render_cidrcn(baseline)
+                  elif args.mode == "check":
+                      candidate = render_reject(normalize_reject(parse_reject(current)))
+                  else:
+                      candidate = sync_reject(current)
+
+                  if args.mode == "check":
+                      if current != candidate:
+                          raise ValueError(f"{target.name} must contain canonical rules only, with no comments or blank lines")
+                      print(f"{target.name} contains canonical rule lines only.")
+                  elif args.mode == "publish":
+                      write_if_changed(target, candidate)
+                  else:
+                      if target == REJECT and preview_reject is not None:
+                          write_if_changed(preview_reject, candidate)
+                      state = "is up to date" if current == candidate else "would change"
+                      print(f"{target.name} {state}.")
+              except (OSError, ValueError, TypeError, KeyError) as error:
+                  print(f"{target.name} sync failed: {error}", file=sys.stderr)
+                  return 1
+              finally:
+                  if summary:
+                      try:
+                          show_direct_report(summary, source_report, filter_report, args.sources, reject_basis)
+                      except OSError as error:
+                          print(f"Could not write DIRECT sync summary: {error}", file=sys.stderr)
+              return 0
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PYTHON
+
+      - name: Verify REJECT rule set
+        shell: bash
+        env:
+          RULE_SYNC_MODE: check
+          RULE_SYNC_TARGET: REJECT
+        run: *sync_rules
+
+      - name: Verify GLOBAI rule set
+        shell: bash
+        env:
+          GLOBAI_SYNC_MODE: check
+        run: &sync_globai |
+          case "${GLOBAI_SYNC_MODE:-preview}" in
+            check) set -- --check ;;
+            preview) set -- ;;
+            publish) set -- --write ;;
+            *) echo 'Unknown GLOBAI sync mode' >&2; exit 1 ;;
+          esac
+          python3 - "$@" <<'PYTHON'
+          import argparse
+          from collections import Counter
+          from difflib import unified_diff
+          from hashlib import sha256
+          from http.client import IncompleteRead
+          import ipaddress
+          import json
+          from os import environ
+          from pathlib import Path
+          import re
+          from ssl import SSLEOFError
+          import sys
+          from tempfile import NamedTemporaryFile
+          from time import sleep
+          from urllib.error import HTTPError, URLError
+          from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+
+          ORIGIN = environ["GLOBAI_MAGICRULE_ORIGIN"]
+          INDEX_URL = f"{ORIGIN}/data/index/Surge.json"
+          ROOT = Path.cwd().resolve()
+          TARGET = ROOT / "RULE-SET/GLOBAI.list"
+          HOST_TYPES = ("DOMAIN", "DOMAIN-SUFFIX")
+          CIDR_TYPES = ("IP-CIDR", "IP-CIDR6")
+          IP_TYPES = (*CIDR_TYPES, "IP-ASN")
+          RULE_TYPES = (*HOST_TYPES, "DOMAIN-KEYWORD", "URL-REGEX", *IP_TYPES, "PROCESS-NAME")
+          LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+          HOSTNAME = re.compile(rf"{LABEL}(?:\.{LABEL})+")
+          REVIEWED_URL_REGEX = r"https://www\.google\.com/.*continue=https://gemini\.google\.com.+"
+          V2FLY = "https://github.com/v2fly/domain-list-community"
+          VPSDANCE = "https://raw.githubusercontent.com/VPSDance/ai-proxy-rules/refs/heads/main/rules/surge"
+          CLASH_AI = "https://raw.githubusercontent.com/jinxinkai/clash-ai-rules/refs/heads/master"
+          RULE_SOURCES = {
+              "OpenAI": (environ["GLOBAI_OPENAI_ID"],
+                         {V2FLY, f"{VPSDANCE}/openai.list", f"{CLASH_AI}/OpenAI.yaml"}),
+              "Gemini": (environ["GLOBAI_GEMINI_ID"], {V2FLY}),
+              "Anthropic": (environ["GLOBAI_ANTHROPIC_ID"],
+                            {V2FLY, f"{VPSDANCE}/anthropic.list", f"{CLASH_AI}/Anthropic.yaml"}),
+              "Grok": (environ["GLOBAI_GROK_ID"], {V2FLY}),
+          }
+          MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+
+
+          class NoRedirect(HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+
+
+          def fetch(url):
+              request = Request(url, headers={"User-Agent": "SG-GlobalAI-Sync/1"})
+              opener = build_opener(NoRedirect)
+              for attempt in range(2):
+                  try:
+                      with opener.open(request, timeout=30) as response:
+                          if response.status != 200:
+                              raise ValueError(f"Expected HTTP 200, received {response.status}")
+                          data = response.read(MAX_RESPONSE_BYTES + 1)
+                      break
+                  except (URLError, ConnectionError, TimeoutError, IncompleteRead, SSLEOFError) as error:
+                      reason = error.reason if isinstance(error, URLError) else error
+                      temporary = (
+                          error.code in (408, 500, 502, 503, 504) if isinstance(error, HTTPError)
+                          else isinstance(reason, (ConnectionError, TimeoutError, IncompleteRead, SSLEOFError))
+                      )
+                      if attempt or not temporary:
+                          raise
+                      print(f"Temporary download failure, retrying in 3 seconds: {url} ({error})")
+                      sleep(3)
+              if len(data) > MAX_RESPONSE_BYTES:
+                  raise ValueError("Upstream response exceeds the size limit")
+              return data
+
+
+          def select_one(items, **fields):
+              matches = [item for item in items
+                         if all(item.get(k) == v for k, v in fields.items())]
+              if len(matches) != 1:
+                  raise ValueError("Could not identify exactly one matching resource")
+              return matches[0]
+
+
+          def magicrule_url(url, path_pattern):
+              if not re.fullmatch(re.escape(ORIGIN) + path_pattern, url):
+                  raise ValueError("Unexpected MagicRule resource URL")
+              return url
+
+
+          def read_source(index, name, rule_id, providers):
+              row = select_one(index["rules"], id=rule_id, name=name)
+              url = magicrule_url(row["manifest"], r"/data/rules/Surge/[0-9a-f]+/manifest\.json")
+              manifest = json.loads(fetch(url))
+              if manifest["client"] != "Surge" or manifest["rule"] != name:
+                  raise ValueError(f"Expected the Surge {name} manifest")
+              if set(manifest["providers"]) != providers:
+                  raise ValueError("Upstream provider list changed. Review provenance before updating.")
+              full = select_one(manifest["artifacts"], key="rules", role="full",
+                                ext="list", empty=False, binary=False)
+              url = magicrule_url(full["url"], rf"/data/_shared/artifacts/{re.escape(name)}_rules_[0-9a-f]+\.list")
+              data = fetch(url)
+              if sha256(data).hexdigest() != full["dedupe"]["bytes_sha256"]:
+                  raise ValueError("Download does not match its manifest SHA-256")
+              rules = parse_rules(data.decode("utf-8-sig"), name)
+              if len(rules) != manifest["total_line_count"] or Counter(r[0] for r in rules) != manifest["type_counts"]:
+                  raise ValueError("Rule counts do not match the manifest")
+              print(f"{name}: {len(rules):,} validated rules from {url}")
+              return rules
+
+
+          def read_sources():
+              index = json.loads(fetch(INDEX_URL))
+              if index["client"] != "Surge":
+                  raise ValueError("Expected the Surge index")
+              rules = []
+              for name, (rule_id, providers) in RULE_SOURCES.items():
+                  try:
+                      rules.extend(read_source(index, name, rule_id, providers))
+                  except (ValueError, OSError, KeyError, TypeError, AttributeError, IncompleteRead) as error:
+                      raise ValueError(f"{name} upstream: {error}") from error
+              return rules
+
+
+          def parse_rules(text, source):
+              rules = []
+              for number, raw in enumerate(text.splitlines(), 1):
+                  line = raw.strip(" \t")
+                  if not line or line.startswith(("#", "//", ";")):
+                      continue
+                  try:
+                      fields = [field.strip(" \t") for field in line.split(",")]
+                      rules.append(parse_rule(fields))
+                  except ValueError as error:
+                      raise ValueError(f"{source} line {number}: {error}") from error
+              if not rules:
+                  raise ValueError(f"{source} has no rules")
+              return rules
+
+
+          def parse_rule(fields):
+              kind = fields[0]
+              if kind not in RULE_TYPES:
+                  raise ValueError("unsupported rule type")
+              if kind in IP_TYPES:
+                  if len(fields) != 3 or fields[2] != "no-resolve":
+                      raise ValueError("expected an IP matcher with no-resolve and no policy")
+              elif len(fields) != 2:
+                  raise ValueError("expected a matcher with no extra fields or policy")
+
+              value = fields[1]
+              if kind in HOST_TYPES:
+                  value = value.lower()
+                  if not fields[1].isascii() or len(value) > 253 or not HOSTNAME.fullmatch(value):
+                      raise ValueError("invalid hostname; expected a multi-label ASCII hostname")
+              elif kind == "DOMAIN-KEYWORD":
+                  if not re.fullmatch(r"[A-Za-z0-9._-]+", value):
+                      raise ValueError("unsupported domain keyword")
+                  value = value.lower()
+              elif kind == "URL-REGEX":
+                  if value != REVIEWED_URL_REGEX:
+                      raise ValueError("URL-REGEX changed; validate the new expression in Surge first")
+              elif kind == "PROCESS-NAME":
+                  if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._ -]*", value):
+                      raise ValueError("unsupported process name")
+              elif kind == "IP-ASN":
+                  match = re.fullmatch(r"(?:AS)?([0-9]{1,10})", value, re.IGNORECASE)
+                  if not match or not 1 <= int(match[1]) <= 4294967295:
+                      raise ValueError("invalid ASN")
+                  value = str(int(match[1]))
+              else:
+                  network = ipaddress.ip_network(value)
+                  expected = 6 if kind == "IP-CIDR6" else 4
+                  if network.version != expected or "%" in value:
+                      raise ValueError("unexpected IP address family or scope")
+                  value = str(network)
+              return (kind, value, *fields[2:])
+
+
+          def covered_by(rule, suffixes):
+              kind, value, *_ = rule
+              if kind not in HOST_TYPES:
+                  return False
+              labels = value.split(".")
+              start = 1 if kind == "DOMAIN-SUFFIX" else 0
+              return any(".".join(labels[i:]) in suffixes for i in range(start, len(labels)))
+
+
+          def sort_key(rule):
+              kind, value, *_ = rule
+              if kind in HOST_TYPES:
+                  value = tuple(reversed(value.split(".")))
+              elif kind in CIDR_TYPES:
+                  value = ipaddress.ip_network(value)
+              elif kind == "IP-ASN":
+                  value = int(value)
+              return RULE_TYPES.index(kind), value
+
+
+          def normalize(rules):
+              unique = set(rules)
+              suffixes = {rule[1] for rule in unique if rule[0] == "DOMAIN-SUFFIX"}
+              retained = [rule for rule in unique if not covered_by(rule, suffixes)]
+              networks = {kind: [] for kind in CIDR_TYPES}
+              output = []
+              for rule in retained:
+                  kind, value, *_ = rule
+                  if kind in networks:
+                      networks[kind].append(ipaddress.ip_network(value))
+                  else:
+                      output.append(rule)
+              for kind, ranges in networks.items():
+                  output.extend((kind, str(net), "no-resolve") for net in ipaddress.collapse_addresses(ranges))
+              return (sorted(output, key=sort_key), len(rules) - len(unique),
+                      len(unique) - len(retained), len(retained) - len(output))
+
+
+          def render(rules):
+              return "".join(",".join(rule) + "\n" for rule in rules)
+
+
+          def atomic_write(target, text):
+              with NamedTemporaryFile(dir=target.parent, mode="w", encoding="utf-8", delete=False) as temp:
+                  temporary = Path(temp.name)
+                  try:
+                      temp.write(text)
+                      temp.close()
+                      temporary.chmod(target.stat().st_mode & 0o777)
+                      temporary.replace(target)
+                  finally:
+                      temporary.unlink(missing_ok=True)
+
+
+          def sync(write, show_diff):
+              old_data = TARGET.read_bytes()
+              old_text = old_data.decode("utf-8-sig")
+              old, _, _, _ = normalize(parse_rules(old_text, "Current GLOBAI.list"))
+              source = read_sources()
+              rules, duplicates, covered, aggregated = normalize(source)
+              added = len(set(rules) - set(old))
+              removed = len(set(old) - set(rules))
+              print(f"Upstream: {len(source)}; duplicates: {duplicates}; covered domains: {covered}; "
+                    f"redundant or merged CIDRs: {aggregated}; output: {len(rules)}")
+              print(f"Compared with normalized repository rules: +{added}, -{removed}")
+              candidate = render(rules)
+              if old_data == candidate.encode("utf-8"):
+                  print("GLOBAI.list is up to date.")
+                  return
+
+              if show_diff:
+                  sys.stdout.writelines(unified_diff(old_text.splitlines(keepends=True),
+                                                     candidate.splitlines(keepends=True),
+                                                     "current/GLOBAI.list", "candidate/GLOBAI.list"))
+              if write:
+                  atomic_write(TARGET, candidate)
+                  print("Updated RULE-SET/GLOBAI.list.")
+              else:
+                  print("Preview complete. Candidate differs from the current file.")
+
+
+          def main():
+              parser = argparse.ArgumentParser(description="Merge and validate MagicRule's AI rule sets for Surge.")
+              mode = parser.add_mutually_exclusive_group()
+              mode.add_argument("--write", action="store_true", help="write RULE-SET/GLOBAI.list")
+              mode.add_argument("--check", action="store_true", help="validate the committed GLOBAI.list")
+              mode.add_argument("--diff", action="store_true", help="preview changes against RULE-SET/GLOBAI.list")
+              args = parser.parse_args()
+              try:
+                  if args.check:
+                      current = TARGET.read_bytes()
+                      rules, _, _, _ = normalize(parse_rules(current.decode("utf-8-sig"), "Current GLOBAI.list"))
+                      if current != render(rules).encode("utf-8"):
+                          raise ValueError("GLOBAI.list is not canonical")
+                      print("GLOBAI.list contains canonical rule lines only.")
+                  else:
+                      sync(args.write, args.diff)
+              except (ValueError, OSError, KeyError, TypeError, AttributeError, IncompleteRead) as error:
+                  print(f"GLOBAI sync failed: {error}", file=sys.stderr)
+                  return 1
+              return 0
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PYTHON
+
+  preview:
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      (github.ref != format('refs/heads/{0}', github.event.repository.default_branch) ||
+      !inputs.publish)
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - *read_only_checkout
+      - name: Preview GLOBAI sync
+        shell: bash
+        run: *sync_globai
+
+      - name: Preview REJECT sync
+        id: preview_reject
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          RULE_SYNC_TARGET: REJECT
+        run: *sync_rules
+      - name: Preview DIRECT sync
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          RULE_SYNC_REJECT_OUTCOME: ${{ steps.preview_reject.outcome }}
+        run: *sync_rules
+
+  publish:
+    name: Sync GLOBAI
+    if: &can_publish >-
+      !cancelled() &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
+      (github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    env:
+      RULE_FILE: RULE-SET/GLOBAI.list
+    steps:
+      - &sync_start
+        name: Record check start time
+        id: start
+        shell: bash
+        run: echo "time=$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')" >> "$GITHUB_OUTPUT"
+      - &publish_checkout
+        name: Check out current rules
+        id: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+      - name: Fetch and validate GLOBAI
+        id: generate
+        shell: bash
+        env:
+          GLOBAI_SYNC_MODE: publish
+        run: *sync_globai
+      - &publish_rule
+        name: Publish rule changes
+        id: push
+        shell: bash
+        run: |
+          git add -- "$RULE_FILE"
+          if git diff --cached --quiet -- "$RULE_FILE"; then
+            echo "$RULE_FILE is unchanged."
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          name="${RULE_FILE##*/}"
+          git commit -m "chore: sync ${name%.list} rules" -- "$RULE_FILE"
+          git push origin "HEAD:${GITHUB_REF}"
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - &summarize_rule
+        name: Show rule sync result
+        if: ${{ always() }}
+        continue-on-error: true
+        shell: bash
+        env:
+          STARTED: ${{ steps.start.outputs.time }}
+          BASE: ${{ steps.checkout.outputs.commit }}
+          CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
+          GENERATE_OUTCOME: ${{ steps.generate.outcome }}
+          PUSH_OUTCOME: ${{ steps.push.outcome }}
+          PUBLISHED: ${{ steps.push.outputs.commit }}
+        run: |
+          python3 - <<'PYTHON'
+          from datetime import datetime
+          from os import environ
+          from pathlib import Path
+          from subprocess import check_output
+          from zoneinfo import ZoneInfo
+
+
+          def rules(ref, path):
+              data = check_output(["git", "show", f"{ref}:{path}"], text=True)
+              return [line for raw in data.splitlines()
+                      if (line := raw.strip()) and not line.startswith(("#", "//", ";"))]
+
+
+          path = environ["RULE_FILE"]
+          base, published = environ["BASE"], environ["PUBLISHED"]
+          if published:
+              status = "✅ 已发布"
+          elif environ["CHECKOUT_OUTCOME"] != "success":
+              status = "❌ 检出失败"
+          elif environ["GENERATE_OUTCOME"] != "success":
+              status = "❌ 拉取或校验未完成"
+          elif environ["PUSH_OUTCOME"] != "success":
+              status = "❌ 发布未完成"
+          else:
+              status = "✅ 规则无变化"
+
+          total = updated = changes = "—"
+          if ref := published or base:
+              current = rules(ref, path)
+              total = f"{len(current):,}"
+              epoch = check_output(["git", "log", "-1", "--format=%ct", ref, "--", path], text=True).strip()
+              if epoch:
+                  updated = datetime.fromtimestamp(int(epoch), ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M:%S")
+              if published and base:
+                  old, new = set(rules(base, path)), set(current)
+                  changes = f"+{len(new - old):,} / -{len(old - new):,}"
+              elif status == "✅ 规则无变化":
+                  changes = "+0 / -0"
+
+          trigger = {"schedule": "定时", "workflow_dispatch": "手动"}.get(
+              environ["GITHUB_EVENT_NAME"], environ["GITHUB_EVENT_NAME"]
+          )
+          fields = [
+              ("结果", status),
+              ("触发方式", trigger),
+              ("本次检查开始 · 北京时间", environ["STARTED"] or "—"),
+              ("规则最后更新时间 · 北京时间", updated),
+              ("已发布规则总数", total),
+              ("本次发布增删", changes),
+          ]
+          with Path(environ["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as summary:
+              print(f"### {Path(path).name}\n\n| 项目 | 结果 |\n| --- | --- |", file=summary)
+              for key, value in fields:
+                  print(f"| {key} | {value} |", file=summary)
+              if published:
+                  link = f"{environ['GITHUB_SERVER_URL']}/{environ['GITHUB_REPOSITORY']}/commit/{published}"
+                  print(f"\n发布提交 [`{published[:7]}`]({link})", file=summary)
+              print(file=summary)
+          PYTHON
+
+  publish-reject:
+    name: Sync REJECT
+    needs: publish
+    if: *can_publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    env:
+      RULE_FILE: RULE-SET/REJECT.list
+    steps:
+      - *sync_start
+      - *publish_checkout
+      - name: Fetch and validate REJECT
+        id: generate
+        shell: bash
+        env:
+          RULE_SYNC_MODE: publish
+          RULE_SYNC_TARGET: REJECT
+        run: *sync_rules
+      - *publish_rule
+      - *summarize_rule
+
+  publish-direct:
+    name: Sync DIRECT
+    needs: publish-reject
+    if: *can_publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    permissions:
+      contents: write
+    env:
+      RULE_FILE: RULE-SET/DIRECT.list
+    steps:
+      - *sync_start
+      - *publish_checkout
+      - name: Fetch and validate DIRECT
+        id: generate
+        shell: bash
+        env:
+          RULE_SYNC_MODE: publish
+          RULE_SYNC_REJECT_OUTCOME: ${{ needs.publish-reject.result }}
+        run: *sync_rules
+      - *publish_rule
+      - *summarize_rule
