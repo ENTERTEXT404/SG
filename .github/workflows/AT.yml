@@ -31,8 +31,8 @@ env:
 
   DIRECT_LOYALSOLDIER_REF_URL: https://api.github.com/repos/Loyalsoldier/surge-rules/git/ref/heads/release
   DIRECT_LOYALSOLDIER_RAW_URL: https://raw.githubusercontent.com/Loyalsoldier/surge-rules
-  DIRECT_SUKKA_IPV4_URL: https://ruleset.skk.moe/List/ip/china_ip.conf
-  DIRECT_SUKKA_IPV6_URL: https://ruleset.skk.moe/List/ip/china_ip_ipv6.conf
+  DIRECT_SUKKA_IPV4_URL: https://raw.githubusercontent.com/SukkaLab/ruleset.skk.moe/master/List/ip/china_ip.conf
+  DIRECT_SUKKA_IPV6_URL: https://raw.githubusercontent.com/SukkaLab/ruleset.skk.moe/master/List/ip/china_ip_ipv6.conf
   DIRECT_OONI_URL: https://api.ooni.io/api/v1/measurements
 
 concurrency:
