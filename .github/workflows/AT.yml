@@ -5,11 +5,15 @@ on:
   schedule:
     - cron: '30 0,8,16 * * *'
   pull_request:
-    paths:
+    paths: &rule_paths
       - '.github/workflows/AT.yml'
       - 'RULE-SET/DIRECT.list'
       - 'RULE-SET/GLOBAI.list'
       - 'RULE-SET/REJECT.list'
+  push:
+    branches:
+      - MASTER
+    paths: *rule_paths
   workflow_dispatch:
     inputs:
       publish:
@@ -41,7 +45,7 @@ concurrency:
 
 jobs:
   check-rules:
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -508,7 +512,9 @@ jobs:
               rate_limited = False
               today = datetime.now(timezone.utc).date()
               if pending:
-                  offset = today.toordinal() % len(pending)
+                  run_number = getenv("GITHUB_RUN_NUMBER")
+                  start = (int(run_number) - 1) * MAX_LOOKUPS if run_number else today.toordinal()
+                  offset = start % len(pending)
                   order = pending[offset:] + pending[:offset]
                   batch = order[:MAX_LOOKUPS]
                   since = today - timedelta(days=30)
