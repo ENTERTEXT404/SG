@@ -686,11 +686,11 @@ jobs:
           VPSDANCE = "https://raw.githubusercontent.com/VPSDance/ai-proxy-rules/refs/heads/main/rules/surge"
           CLASH_AI = "https://raw.githubusercontent.com/jinxinkai/clash-ai-rules/refs/heads/master"
           RULE_SOURCES = {
+              "Anthropic": (environ["GLOBAI_ANTHROPIC_ID"],
+                            {V2FLY, f"{VPSDANCE}/anthropic.list", f"{CLASH_AI}/Anthropic.yaml"}),
               "OpenAI": (environ["GLOBAI_OPENAI_ID"],
                          {V2FLY, f"{VPSDANCE}/openai.list", f"{CLASH_AI}/OpenAI.yaml"}),
               "Gemini": (environ["GLOBAI_GEMINI_ID"], {V2FLY}),
-              "Anthropic": (environ["GLOBAI_ANTHROPIC_ID"],
-                            {V2FLY, f"{VPSDANCE}/anthropic.list", f"{CLASH_AI}/Anthropic.yaml"}),
               "Grok": (environ["GLOBAI_GROK_ID"], {V2FLY}),
           }
           MAX_RESPONSE_BYTES = 8 * 1024 * 1024
