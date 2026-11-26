@@ -60,10 +60,12 @@ jobs:
         run: &sync_rules |
           python3 - "${RULE_SYNC_MODE:-preview}" "${RULE_SYNC_TARGET:-DIRECT}" <<'PYTHON'
           import argparse
+          from concurrent.futures import ThreadPoolExecutor
           from contextlib import contextmanager
           from html import escape
           from http.client import IncompleteRead
           import ipaddress
+          from itertools import repeat
           import json
           from datetime import date, datetime, timedelta, timezone
           from os import environ, getenv
@@ -89,7 +91,10 @@ jobs:
           DIRECT_EXTRAS = set()
           REJECT_SOURCE = environ["REJECT_AWAVENUE_URL"]
           MEASUREMENTS = environ["DIRECT_OONI_URL"]
-          MAX_LOOKUPS = 8
+          MAX_LOOKUPS = 24
+          LOOKUP_WORKERS = 3
+          OONI_CACHE_TTL = 12 * 60 * 60
+          CACHEABLE_OUTCOMES = ("supported", "insufficient")
           HOST_TYPES = ("DOMAIN", "DOMAIN-SUFFIX")
           LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
           HOSTNAME = re.compile(rf"{LABEL}(?:\.{LABEL})*")
@@ -478,9 +483,54 @@ jobs:
               except HTTPError as error:
                   print(f"OONI {host}: measurement lookup unavailable ({error})")
                   return "rate_limited" if error.code == 429 else "unavailable"
-              except (OSError, ValueError, TypeError, AttributeError, KeyError) as error:
+              except (OSError, ValueError, TypeError, AttributeError, KeyError, IncompleteRead) as error:
                   print(f"OONI {host}: measurement lookup unavailable ({error})")
                   return "unavailable"
+
+
+          def load_ooni_cache(path, since, timestamp):
+              if path is None:
+                  return {}
+              try:
+                  data = json.loads(path.read_text(encoding="utf-8"))
+              except FileNotFoundError:
+                  return {}
+              except (OSError, ValueError) as error:
+                  print(f"Could not read OONI cache: {error}")
+                  return {}
+              if not isinstance(data, dict) or data.get("since") != since.isoformat():
+                  return {}
+              entries = data.get("entries")
+              if not isinstance(entries, dict):
+                  return {}
+              return {host: entry for host, entry in entries.items()
+                      if isinstance(entry, list) and len(entry) == 2
+                      and entry[0] in CACHEABLE_OUTCOMES and isinstance(entry[1], int)
+                      and 0 <= timestamp - entry[1] < OONI_CACHE_TTL}
+
+
+          def save_ooni_cache(path, since, entries):
+              try:
+                  data = json.dumps({"since": since.isoformat(), "entries": entries}, sort_keys=True)
+                  write_if_changed(path, data.encode("utf-8"))
+                  if output_path := getenv("GITHUB_OUTPUT"):
+                      with Path(output_path).open("a", encoding="utf-8") as output:
+                          print("ooni_cache_updated=true", file=output)
+              except OSError as error:
+                  print(f"Could not save OONI cache: {error}")
+
+
+          def query_ooni(hosts, since):
+              results = {}
+              with ThreadPoolExecutor(max_workers=LOOKUP_WORKERS) as executor:
+                  for start in range(0, len(hosts), LOOKUP_WORKERS):
+                      if start:
+                          sleep(1)
+                      batch = hosts[start:start + LOOKUP_WORKERS]
+                      results.update(zip(batch, executor.map(mainland_evidence, batch, repeat(since))))
+                      if "rate_limited" in results.values():
+                          break
+              return results
 
 
           def fully_rejected(rule, reject_hosts, reject_parents, reject_keywords):
@@ -528,22 +578,34 @@ jobs:
               outcomes = dict.fromkeys(("supported", "insufficient", "unavailable"), 0)
               deferred = len(pending)
               rate_limited = False
-              today = datetime.now(timezone.utc).date()
+              cache_hits = queried = 0
               if pending:
+                  now = datetime.now(timezone.utc)
+                  today = now.date()
+                  since = today - timedelta(days=30)
+                  timestamp = int(now.timestamp())
                   run_number = getenv("GITHUB_RUN_NUMBER")
                   start = (int(run_number) - 1) * MAX_LOOKUPS if run_number else today.toordinal()
                   offset = start % len(pending)
                   order = pending[offset:] + pending[:offset]
-                  batch = order[:MAX_LOOKUPS]
-                  since = today - timedelta(days=30)
-                  for index, rule in enumerate(batch):
-                      if index:
-                          sleep(1)
-                      outcome = mainland_evidence(rule[1], since)
-                      if outcome == "rate_limited":
-                          rate_limited = True
-                          print(f"Deferred {len(batch) - index} domains after OONI rate limiting")
-                          break
+                  runner_temp = getenv("RUNNER_TEMP")
+                  cache_path = Path(runner_temp) / "sg-ooni-evidence.json" if runner_temp else None
+                  cache = load_ooni_cache(cache_path, since, timestamp)
+                  cached = {host: cache[host][0] for _, host in order if host in cache}
+                  uncached = [host for _, host in order if host not in cached]
+                  fetched = query_ooni(uncached[:MAX_LOOKUPS], since)
+                  rate_limited = "rate_limited" in fetched.values()
+                  cache_hits, queried = len(cached), len(fetched)
+                  updates = {host: [outcome, timestamp] for host, outcome in fetched.items()
+                             if outcome in CACHEABLE_OUTCOMES}
+                  if cache_path and updates:
+                      cache.update(updates)
+                      save_ooni_cache(cache_path, since, cache)
+                  results = cached | fetched
+                  for rule in order:
+                      outcome = results.get(rule[1])
+                      if outcome not in outcomes:
+                          continue
                       deferred -= 1
                       outcomes[outcome] += 1
                       if outcome == "supported":
@@ -553,9 +615,11 @@ jobs:
                           detail = "mainland measurement lookup unavailable"
                       else:
                           detail = "insufficient mainland measurements"
+                      if rule[1] in cached:
+                          detail += " (cached)"
                       print(f"{'Accept' if outcome == 'supported' else 'Skip'} {','.join(rule)}: {detail}")
-                  if len(order) > MAX_LOOKUPS:
-                      print(f"Deferred {len(order) - MAX_LOOKUPS} new domains to a later lookup window")
+                  if deferred:
+                      print(f"Deferred {deferred} new domains to a later lookup window")
               result = compact_hosts(retained | approved)
               tracked_changes("DIRECT published domains", old, result)
               filter_report.update({
@@ -563,6 +627,8 @@ jobs:
                   "被 REJECT 覆盖（含现有规则）": len(conflicts),
                   "已被保留的直连后缀覆盖": covered,
                   "私有域名或手工规则直接通过": preapproved,
+                  "OONI 实际查询": queried,
+                  "OONI 缓存命中": cache_hits,
                   "通过大陆连通性检查": outcomes["supported"],
                   "大陆连通性证据不足": outcomes["insufficient"],
                   "测量服务查询失败": outcomes["unavailable"],
@@ -1017,6 +1083,15 @@ jobs:
         env:
           RULE_SYNC_TARGET: REJECT
         run: *sync_rules
+      - &restore_ooni_cache
+        name: Restore OONI evidence cache
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25
+        with:
+          path: &ooni_cache_path ${{ runner.temp }}/sg-ooni-evidence.json
+          key: &ooni_cache_key sg-ooni-evidence-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: sg-ooni-evidence-v1-
       - name: Preview DIRECT sync
         if: ${{ !cancelled() }}
         shell: bash
@@ -1182,6 +1257,7 @@ jobs:
     steps:
       - *sync_start
       - *publish_checkout
+      - *restore_ooni_cache
       - name: Fetch and validate DIRECT
         id: generate
         shell: bash
@@ -1190,4 +1266,11 @@ jobs:
           RULE_SYNC_REJECT_OUTCOME: ${{ needs.publish-reject.result }}
         run: *sync_rules
       - *publish_rule
+      - name: Save OONI evidence cache
+        if: ${{ !cancelled() && steps.generate.outputs.ooni_cache_updated == 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25
+        with:
+          path: *ooni_cache_path
+          key: *ooni_cache_key
       - *summarize_rule
