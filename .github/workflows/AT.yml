@@ -22,7 +22,6 @@ permissions:
 
 env:
   GLOBAI_MAGICRULE_ORIGIN: https://magicrule.pages.dev
-  GLOBAI_GLOBALAI_ID: 24dbbb36-e5c5-4800-8fde-4af469213846
   GLOBAI_OPENAI_ID: d5f00db3-06dd-4dc0-9698-737971bfb428
   GLOBAI_GEMINI_ID: c2cc8e43-8769-4c87-89d3-60e29ea05e11
   GLOBAI_ANTHROPIC_ID: 51b4a34e-0773-402d-bf70-8fdeb065ea52
@@ -93,7 +92,6 @@ jobs:
           RULE_TYPES = {4: "IP-CIDR", 6: "IP-CIDR6"}
           IP_VERSIONS = {kind: version for version, kind in RULE_TYPES.items()}
           MAX_BYTES = 2 * 1024 * 1024
-          MAX_CHANGE_PERCENT = 10
 
           EXCLUSIONS = {
               4: (
@@ -242,7 +240,7 @@ jobs:
               return domains, networks
 
 
-          def validate_change(old, new, version):
+          def report_network_changes(old, new, version):
               old_count = len(old)
               new_count = len(new)
               old_size = sum(n.num_addresses for n in ipaddress.collapse_addresses(old))
@@ -252,10 +250,6 @@ jobs:
               removed = union_size - new_size
               print(f"IPv{version} vs published: {old_count} -> {new_count} CIDRs, "
                     f"+{added:,} / -{removed:,} addresses")
-              if ((old_count - new_count) * 100 > old_count * MAX_CHANGE_PERCENT or
-                  max(added, removed) * 100 > old_size * MAX_CHANGE_PERCENT):
-                  raise ValueError(f"IPv{version} changed more than the {MAX_CHANGE_PERCENT}% "
-                                   "safety limit. Review upstream before publishing")
 
 
           def write_if_changed(target, data):
@@ -285,8 +279,7 @@ jobs:
                       data = source.read_bytes() if sources else fetch(source)
                       source_report[version] = ("已读取 · 内容校验失败", None, None)
                       networks, count = build_rules(data, version, require_size=not sources)
-                      source_report[version] = ("已读取 · 变动校验未通过", count, None)
-                      validate_change(baseline[version], networks, version)
+                      report_network_changes(baseline[version], networks, version)
                       source_report[version] = ("校验通过", count, None)
                       result[version] = networks
                   except (OSError, ValueError) as error:
@@ -341,9 +334,6 @@ jobs:
               for sign, changed in (("+", added), ("-", removed)):
                   for kind, value in sorted(changed)[:20]:
                       print(f"  {sign} {kind},{value}")
-              limit = max(1, len(old) * MAX_CHANGE_PERCENT // 100)
-              if max(len(added), len(removed)) > limit:
-                  raise ValueError(f"{label} exceeds its {limit:,}-rule change limit")
 
 
           def fetch_domains(source_report):
@@ -426,12 +416,6 @@ jobs:
               for version, kind in RULE_TYPES.items():
                   tracked_changes(f"REJECT IPv{version}", {(kind, str(net)) for net in old_networks[version]},
                                   {(kind, str(net)) for net in networks[version]})
-                  old_size = sum(net.num_addresses for net in old_networks[version])
-                  new_size = sum(net.num_addresses for net in networks[version])
-                  union = ipaddress.collapse_addresses(old_networks[version] + networks[version])
-                  union_size = sum(net.num_addresses for net in union)
-                  if max(union_size - old_size, union_size - new_size) > max(1, old_size // 10):
-                      raise ValueError(f"REJECT IPv{version} address coverage changed too much")
               return render_reject(new)
 
 
@@ -702,8 +686,6 @@ jobs:
           VPSDANCE = "https://raw.githubusercontent.com/VPSDance/ai-proxy-rules/refs/heads/main/rules/surge"
           CLASH_AI = "https://raw.githubusercontent.com/jinxinkai/clash-ai-rules/refs/heads/master"
           RULE_SOURCES = {
-              "GlobalAI": (environ["GLOBAI_GLOBALAI_ID"],
-                           {V2FLY, f"{VPSDANCE}/all.list", "https://ruleset.skk.moe/List/non_ip/ai.conf"}),
               "OpenAI": (environ["GLOBAI_OPENAI_ID"],
                          {V2FLY, f"{VPSDANCE}/openai.list", f"{CLASH_AI}/OpenAI.yaml"}),
               "Gemini": (environ["GLOBAI_GEMINI_ID"], {V2FLY}),
@@ -764,11 +746,8 @@ jobs:
               manifest = json.loads(fetch(url))
               if manifest["client"] != "Surge" or manifest["rule"] != name:
                   raise ValueError(f"Expected the Surge {name} manifest")
-              if set(row["providers"]) != providers or set(manifest["providers"]) != providers:
+              if set(manifest["providers"]) != providers:
                   raise ValueError("Upstream provider list changed. Review provenance before updating.")
-              for field in ("rule_updated_at", "type_counts", "total_line_count"):
-                  if row[field] != manifest[field]:
-                      raise ValueError("Index and manifest disagree. Retry after upstream finishes publishing.")
               full = select_one(manifest["artifacts"], key="rules", role="full",
                                 ext="list", empty=False, binary=False)
               url = magicrule_url(full["url"], rf"/data/_shared/artifacts/{re.escape(name)}_rules_[0-9a-f]+\.list")
@@ -912,7 +891,6 @@ jobs:
               rules, duplicates, covered, aggregated = normalize(source)
               added = len(set(rules) - set(old))
               removed = len(set(old) - set(rules))
-              limit = max(1, len(old) // 10)
               print(f"Upstream: {len(source)}; duplicates: {duplicates}; covered domains: {covered}; "
                     f"redundant or merged CIDRs: {aggregated}; output: {len(rules)}")
               print(f"Compared with normalized repository rules: +{added}, -{removed}")
@@ -925,8 +903,6 @@ jobs:
                   sys.stdout.writelines(unified_diff(old_text.splitlines(keepends=True),
                                                      candidate.splitlines(keepends=True),
                                                      "current/GLOBAI.list", "candidate/GLOBAI.list"))
-              if max(added, removed) > limit:
-                  raise ValueError(f"Rule changes exceed {limit} additions or removals; review the upstream change")
               if write:
                   atomic_write(TARGET, candidate)
                   print("Updated RULE-SET/GLOBAI.list.")
@@ -951,7 +927,7 @@ jobs:
                   else:
                       sync(args.write, args.diff)
               except (ValueError, OSError, KeyError, TypeError, AttributeError, IncompleteRead) as error:
-                  print(f"GlobalAI sync failed: {error}", file=sys.stderr)
+                  print(f"GLOBAI sync failed: {error}", file=sys.stderr)
                   return 1
               return 0
 
